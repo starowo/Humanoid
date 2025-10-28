@@ -7,10 +7,16 @@ from discord import app_commands
 from discord.ext import commands
 from datetime import datetime
 from typing import Optional
+import asyncio
 
 
 class ChannelManager(commands.Cog, name="频道管理"):
     """频道管理 Cog"""
+    
+    # 硬编码的违禁词配置（按频道ID）
+    BANNED_WORDS_BY_CHANNEL = {
+        1369280790785036418: ["屁", "眼", "py", "母", "猪", "🐖", "🐽"]
+    }
     
     def __init__(self, bot):
         self.bot = bot
@@ -26,6 +32,19 @@ class ChannelManager(commands.Cog, name="频道管理"):
     async def on_config_reload(self):
         """配置重载回调"""
         self.load_config()
+    
+    def check_banned_words(self, text: str, channel_id: int) -> bool:
+        """检查文本中是否包含违禁词"""
+        # 获取该频道的违禁词列表
+        banned_words = self.BANNED_WORDS_BY_CHANNEL.get(channel_id, [])
+        if not banned_words:
+            return False
+        
+        text_lower = text.lower()
+        for word in banned_words:
+            if word.lower() in text_lower:
+                return True
+        return False
     
     def check_role_permission(self, member: discord.Member) -> bool:
         """检查用户是否有权限使用命令"""
@@ -76,6 +95,13 @@ class ChannelManager(commands.Cog, name="频道管理"):
             await interaction.response.send_message("❌ 频道名称不能为空！", ephemeral=True)
             return
         
+        # 检查违禁词
+        if self.check_banned_words(new_name, interaction.channel.id):
+            await interaction.response.send_message(
+                "呜哇！这个太色情了，我不看我不看"
+            )
+            return
+        
         if len(new_name) > 100:
             await interaction.response.send_message(
                 f"❌ 频道名称太长了！当前 {len(new_name)} 个字符，最多 100 个字符。",
@@ -98,9 +124,9 @@ class ChannelManager(commands.Cog, name="频道管理"):
         # 先响应，避免超时
         await interaction.response.send_message(f"🔄 正在修改频道名称: `{old_name}` → `{new_name}`")
         
-        # 尝试修改频道名称
+        # 尝试修改频道名称（设置3秒超时，避免被速率限制阻塞）
         try:
-            await channel.edit(name=new_name)
+            await asyncio.wait_for(channel.edit(name=new_name), timeout=3.0)
             
             # 发送成功消息
             embed = discord.Embed(
@@ -119,6 +145,12 @@ class ChannelManager(commands.Cog, name="频道管理"):
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
                   f"频道名称已修改: {old_name} → {new_name} "
                   f"(操作者: {interaction.user.name})")
+            
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                "❌ 修改失败：Discord API 速率限制\n"
+                "每个频道每10分钟最多只能修改2次名称，请稍后再试。"
+            )
             
         except discord.errors.HTTPException as e:
             if e.status == 429:  # Rate limited
