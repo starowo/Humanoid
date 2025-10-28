@@ -20,13 +20,56 @@
 
 ## 🚀 快速开始
 
-### 1. 安装依赖
+### 方式一：一键启动（推荐）⭐
+
+#### Windows 用户
+
+1. **首次使用 - 运行安装脚本：**
+   ```bash
+   双击 install.bat
+   ```
+   这会自动创建虚拟环境、安装依赖并创建配置文件
+
+2. **编辑配置文件：**
+   打开 `config/config.yaml`，填写你的 Bot Token 和 ID
+
+3. **启动 Bot：**
+   ```bash
+   双击 start.bat
+   ```
+
+#### Linux/Mac 用户
+
+1. **赋予脚本执行权限：**
+   ```bash
+   chmod +x start.sh install.sh update.sh
+   ```
+
+2. **运行安装脚本：**
+   ```bash
+   ./install.sh
+   ```
+
+3. **编辑配置文件：**
+   ```bash
+   nano config/config.yaml
+   # 或使用你喜欢的编辑器
+   ```
+
+4. **启动 Bot：**
+   ```bash
+   ./start.sh
+   ```
+
+### 方式二：手动安装
+
+#### 1. 安装依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 配置 Bot
+#### 2. 配置 Bot
 
 复制配置文件模板：
 
@@ -51,27 +94,54 @@ channel_manager:
     - 1234567890  # 替换为你要允许修改的频道 ID
 ```
 
-### 3. 获取必要的 ID
+#### 3. 获取必要的 ID
 
-#### 获取身份组 ID：
+##### 获取身份组 ID：
 1. 在 Discord 中右键点击身份组
 2. 选择"复制 ID"（需要开启开发者模式）
 
-#### 获取频道 ID：
+##### 获取频道 ID：
 1. 在 Discord 中右键点击频道
 2. 选择"复制 ID"
 
-#### 获取 Bot Token：
+##### 获取 Bot Token：
 1. 访问 [Discord Developer Portal](https://discord.com/developers/applications)
 2. 创建或选择你的应用
 3. 进入 "Bot" 页面
 4. 点击 "Reset Token" 或 "Copy" 获取 Token
 
-### 4. 运行 Bot
+#### 4. 运行 Bot
 
 ```bash
 python bot.py
 ```
+
+## 📜 启动脚本说明
+
+项目提供了多个便捷的启动脚本：
+
+| 脚本 | 说明 | 适用系统 |
+|------|------|----------|
+| `start.bat` | 一键启动（自动检查环境和依赖） | Windows |
+| `start.sh` | 一键启动（自动检查环境和依赖） | Linux/Mac |
+| `install.bat` | 安装依赖和创建配置 | Windows |
+| `install.sh` | 安装依赖和创建配置 | Linux/Mac |
+| `update.bat` | 更新依赖包 | Windows |
+| `update.sh` | 更新依赖包 | Linux/Mac |
+
+### 脚本功能
+
+所有启动脚本 (`start.bat` / `start.sh`) 都会自动：
+1. ✅ 检查并创建虚拟环境
+2. ✅ 激活虚拟环境
+3. ✅ 检查并安装依赖包
+4. ✅ 检查配置文件（首次运行会自动创建）
+5. ✅ 启动 Bot
+
+**优点：**
+- 🔒 独立的虚拟环境，不污染系统 Python
+- 🚀 一键启动，无需手动操作
+- 🛡️ 自动检查依赖，避免运行错误
 
 ## 🔧 配置说明
 
