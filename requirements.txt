@@ -1,0 +1,11 @@
+# Discord Bot 依赖包
+
+# Discord.py - Discord API 封装库
+discord.py>=2.3.0
+
+# PyYAML - YAML 配置文件解析
+PyYAML>=6.0
+
+# Python-dotenv - 环境变量管理（可选）
+python-dotenv>=1.0.0
+

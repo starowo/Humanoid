@@ -1,0 +1,27 @@
+# Discord Bot 配置文件示例
+# 复制此文件为 config.yaml 并填写你的配置
+
+# Bot Token (从 Discord Developer Portal 获取)
+token: "YOUR_BOT_TOKEN_HERE"
+
+# Bot 命令前缀
+prefix: "/"
+
+# 允许使用 bot 的身份组 ID 列表
+allowed_role_ids:
+  - 1234567890  # 替换为你的身份组 ID
+
+# 频道管理配置
+channel_manager:
+  # 允许被修改名称的频道 ID 列表
+  allowed_channel_ids:
+    - 1234567890  # 替换为你要允许修改的频道 ID
+  
+  # 频道名称修改冷却时间（秒）Discord API 限制：每10分钟最多2次
+  cooldown: 300  # 5分钟冷却
+
+# 热重载配置
+hot_reload:
+  enabled: true
+  watch_interval: 2  # 配置文件检查间隔（秒）
+
