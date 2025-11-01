@@ -119,8 +119,8 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                                     found_count += 1
                                     
                                     # 更新 max_id 为最旧的消息 ID
-                                    if message_id < current_max_id:
-                                        current_max_id = message_id-1
+                                    if message_id < current_max_id or current_max_id == -1:
+                                        current_max_id = message_id
                             
                             search_count += 1
                             progress_data['searched'] += found_count
