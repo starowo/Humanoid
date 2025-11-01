@@ -4,6 +4,7 @@
 """
 import discord
 from discord import app_commands
+from discord.abc import Snowflake
 from discord.ext import commands
 from datetime import datetime
 from typing import Optional
@@ -185,7 +186,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                     channel = self.bot.get_channel(channel_id)
                     if not channel:
                         channel = await self.bot.fetch_channel(channel_id)
-                    await channel.delete_messages(message_ids)
+                    await channel.delete_messages(Snowflake.id(message_ids))
                     
                     progress_data['deleted'] += len(message_ids)
                     progress_data['last_delete_time'] = datetime.now()
