@@ -302,7 +302,6 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
     @app_commands.command(name="一键冲水", description="删除指定用户在指定范围内的所有消息")
     @app_commands.describe(
         用户="要删除消息的用户",
-        起始消息id="起始消息ID（从这条消息开始搜索，留空则从最新消息开始）",
         频道="指定频道（留空则搜索整个服务器）"
     )
     async def flush_messages(
