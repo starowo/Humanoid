@@ -48,7 +48,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
         return any(role_id in member_role_ids for role_id in self.allowed_role_ids)
     
     async def search_messages(self, guild_id: int, author_id: int, channel_id: Optional[int], 
-                             min_id: int, message_queue: deque, stop_event: asyncio.Event, 
+                             message_queue: deque, stop_event: asyncio.Event, 
                              progress_data: dict):
         """搜索消息的协程"""
         headers = {
@@ -66,7 +66,6 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                     url = (
                         f"https://discord.com/api/v9/guilds/{guild_id}/messages/search"
                         f"?author_id={author_id}"
-                        f"&min_id={min_id}"
                         f"&sort_by=timestamp"
                         f"&sort_order=desc"
                         f"&offset=0"
@@ -120,7 +119,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                                     found_count += 1
                                     
                                     # 更新 max_id 为最旧的消息 ID
-                                    if message_id > current_max_id:
+                                    if message_id < current_max_id:
                                         current_max_id = message_id-1
                             
                             search_count += 1
@@ -310,7 +309,6 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
         self, 
         interaction: discord.Interaction, 
         用户: discord.Member,
-        起始消息id: Optional[str] = None,
         频道: Optional[discord.TextChannel] = None
     ):
         """一键冲水命令"""
@@ -331,16 +329,6 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
             )
             return
         
-        # 解析起始消息 ID
-        try:
-            min_id = int(起始消息id) if 起始消息id else 0
-        except ValueError:
-            await interaction.response.send_message(
-                "❌ 起始消息ID格式错误！",
-                ephemeral=True
-            )
-            return
-        
         # 创建初始 Embed
         embed = discord.Embed(
             title="🚽 一键冲水启动中...",
@@ -353,8 +341,6 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
             value=频道.mention if 频道 else "整个服务器", 
             inline=True
         )
-        if 起始消息id:
-            embed.add_field(name="起始消息ID", value=f"`{起始消息id}`", inline=True)
         
         await interaction.response.send_message(embed=embed)
         message = await interaction.original_response()
@@ -386,7 +372,6 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                 interaction.guild.id,
                 用户.id,
                 频道.id if 频道 else None,
-                min_id,
                 message_queue,
                 stop_event,
                 progress_data
