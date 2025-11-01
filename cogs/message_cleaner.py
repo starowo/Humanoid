@@ -180,13 +180,13 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                     batch.append(message_queue.popleft())
                 
                 for msg_info in batch:
-                    batch_per_channel.setdefault(msg_info['channel_id'], []).append(msg_info['id'])
+                    batch_per_channel.setdefault(msg_info['channel_id'], []).append(Snowflake(id=msg_info['id']))
                 
                 for channel_id, message_ids in batch_per_channel.items():
                     channel = self.bot.get_channel(channel_id)
                     if not channel:
                         channel = await self.bot.fetch_channel(channel_id)
-                    await channel.delete_messages(Snowflake.id(message_ids))
+                    await channel.delete_messages(message_ids)
                     
                     progress_data['deleted'] += len(message_ids)
                     progress_data['last_delete_time'] = datetime.now()
