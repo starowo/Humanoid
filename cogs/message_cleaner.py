@@ -66,7 +66,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                     url = (
                         f"https://discord.com/api/v9/guilds/{guild_id}/messages/search"
                         f"?author_id={author_id}"
-                        f"&min_id=min_id"
+                        f"&min_id={min_id}"
                         f"&sort_by=timestamp"
                         f"&sort_order=desc"
                         f"&offset=0"
