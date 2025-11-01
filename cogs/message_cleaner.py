@@ -56,7 +56,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
             'Content-Type': 'application/json'
         }
         
-        current_min_id = min_id
+        current_max_id = -1
         search_count = 0
         
         async with aiohttp.ClientSession() as session:
@@ -66,7 +66,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                     url = (
                         f"https://discord.com/api/v9/guilds/{guild_id}/messages/search"
                         f"?author_id={author_id}"
-                        f"&min_id={current_min_id}"
+                        f"&min_id=min_id"
                         f"&sort_by=timestamp"
                         f"&sort_order=desc"
                         f"&offset=0"
@@ -76,6 +76,9 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                     # 如果指定了频道，添加频道参数
                     if channel_id:
                         url += f"&channel_id={channel_id}"
+                    
+                    if current_max_id != -1:
+                        url += f"&max_id={current_max_id}"
                     
                     # 发送请求
                     async with session.get(url, headers=headers) as response:
@@ -116,9 +119,9 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                                     message_queue.append(message_info)
                                     found_count += 1
                                     
-                                    # 更新 min_id 为最新的消息 ID
-                                    if message_id < current_min_id:
-                                        current_min_id = message_id
+                                    # 更新 max_id 为最旧的消息 ID
+                                    if message_id > current_max_id:
+                                        current_max_id = message_id-1
                             
                             search_count += 1
                             progress_data['searched'] += found_count
@@ -190,10 +193,13 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                     
                     progress_data['deleted'] += len(message_ids)
                     progress_data['last_delete_time'] = datetime.now()
+                
+                await asyncio.sleep(10)
 
             except Exception as e:
                 progress_data['error'] = f'删除错误: {str(e)}'
                 break
+        
     
     async def update_progress_embed(self, interaction: discord.Interaction, progress_data: dict, 
                                    message: discord.Message):
