@@ -180,7 +180,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                     batch.append(message_queue.popleft())
                 
                 for msg_info in batch:
-                    batch_per_channel.setdefault(msg_info['channel_id'], []).append({id: msg_info['id']})
+                    batch_per_channel.setdefault(msg_info['channel_id'], []).append(discord.Object(msg_info['id']))
                 
                 for channel_id, message_ids in batch_per_channel.items():
                     channel = self.bot.get_channel(channel_id)
