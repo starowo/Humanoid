@@ -19,6 +19,31 @@ channel_manager:
   
   # 频道名称修改冷却时间（秒）Discord API 限制：每10分钟最多2次
   cooldown: 300  # 5分钟冷却
+  
+  # 默认频道名称前缀 emoji
+  default_emoji: "💬"
+  
+  # 违禁词配置（按频道ID）
+  banned_words:
+    # 示例：频道ID和对应的违禁词列表
+    1234567890:
+      - "违禁词1"
+      - "违禁词2"
+
+# 一键冲水配置
+message_cleaner:
+  # 用户 Token（用于调用 Discord API v9 搜索接口）
+  # 获取方法：F12 打开开发者工具 -> Network -> 找到任意请求 -> Headers -> Authorization
+  user_token: "YOUR_USER_TOKEN_HERE"
+  
+  # 搜索间隔（秒）避免速率限制
+  search_interval: 5
+  
+  # 删除批次大小（每批删除多少条消息）
+  delete_batch_size: 10
+  
+  # 最大消息数（防止搜索过多消息）
+  max_messages: 100000
 
 # 热重载配置
 hot_reload:

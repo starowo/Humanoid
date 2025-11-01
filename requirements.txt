@@ -6,6 +6,9 @@ discord.py>=2.3.0
 # PyYAML - YAML 配置文件解析
 PyYAML>=6.0
 
+# aiohttp - 异步 HTTP 客户端（用于 Discord API v9 调用）
+aiohttp>=3.9.0
+
 # Python-dotenv - 环境变量管理（可选）
 python-dotenv>=1.0.0
 

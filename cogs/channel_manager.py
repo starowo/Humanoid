@@ -13,11 +13,6 @@ import asyncio
 class ChannelManager(commands.Cog, name="频道管理"):
     """频道管理 Cog"""
     
-    # 硬编码的违禁词配置（按频道ID）
-    BANNED_WORDS_BY_CHANNEL = {
-        1369280790785036418: ["屁", "眼", "py", "母", "猪", "🐖", "🐽", "🐷", "🐗"]
-    }
-    
     def __init__(self, bot):
         self.bot = bot
         self.config_loader = bot.config_loader
@@ -28,6 +23,8 @@ class ChannelManager(commands.Cog, name="频道管理"):
         self.allowed_role_ids = self.config_loader.get('allowed_role_ids', [])
         self.allowed_channel_ids = self.config_loader.get('channel_manager.allowed_channel_ids', [])
         self.cooldown_seconds = self.config_loader.get('channel_manager.cooldown', 300)
+        self.default_emoji = self.config_loader.get('channel_manager.default_emoji', '💬')
+        self.banned_words_by_channel = self.config_loader.get('channel_manager.banned_words', {})
     
     async def on_config_reload(self):
         """配置重载回调"""
@@ -36,7 +33,7 @@ class ChannelManager(commands.Cog, name="频道管理"):
     def check_banned_words(self, text: str, channel_id: int) -> bool:
         """检查文本中是否包含违禁词"""
         # 获取该频道的违禁词列表
-        banned_words = self.BANNED_WORDS_BY_CHANNEL.get(channel_id, [])
+        banned_words = self.banned_words_by_channel.get(channel_id, [])
         if not banned_words:
             return False
         
@@ -62,9 +59,12 @@ class ChannelManager(commands.Cog, name="频道管理"):
         return channel_id in self.allowed_channel_ids
     
     @app_commands.command(name="改改的名", description="修改当前频道的名称")
-    @app_commands.describe(新频道名="要设置的新频道名称（1-100个字符）")
+    @app_commands.describe(
+        新频道名="要设置的新频道名称（1-100个字符）",
+        emoji="频道名称前的emoji（可选，不填则使用默认emoji）"
+    )
     @app_commands.checks.cooldown(1, 300, key=lambda i: i.user.id)
-    async def change_channel_name(self, interaction: discord.Interaction, 新频道名: str):
+    async def change_channel_name(self, interaction: discord.Interaction, 新频道名: str, emoji: Optional[str] = None):
         """修改频道名称的斜杠命令"""
         
         # 检查用户权限
@@ -102,9 +102,13 @@ class ChannelManager(commands.Cog, name="频道管理"):
             )
             return
         
-        if len(new_name) > 100:
+        # 处理emoji前缀
+        channel_emoji = emoji if emoji else self.default_emoji
+        final_name = f"{channel_emoji}丨{new_name}"
+        
+        if len(final_name) > 100:
             await interaction.response.send_message(
-                f"❌ 频道名称太长了！当前 {len(new_name)} 个字符，最多 100 个字符。",
+                f"❌ 频道名称太长了！当前 {len(final_name)} 个字符，最多 100 个字符。",
                 ephemeral=True
             )
             return
@@ -117,16 +121,16 @@ class ChannelManager(commands.Cog, name="频道管理"):
         channel = interaction.channel
         old_name = channel.name
         
-        if old_name == new_name:
+        if old_name == final_name:
             await interaction.response.send_message("⚠️ 新名称与当前名称相同！", ephemeral=True)
             return
         
         # 先响应，避免超时
-        await interaction.response.send_message(f"🔄 正在修改频道名称: `{old_name}` → `{new_name}`")
+        await interaction.response.send_message(f"🔄 正在修改频道名称: `{old_name}` → `{final_name}`")
         
         # 尝试修改频道名称（设置3秒超时，避免被速率限制阻塞）
         try:
-            await asyncio.wait_for(channel.edit(name=new_name), timeout=3.0)
+            await asyncio.wait_for(channel.edit(name=final_name), timeout=3.0)
             
             # 发送成功消息
             embed = discord.Embed(
@@ -135,15 +139,19 @@ class ChannelManager(commands.Cog, name="频道管理"):
                 timestamp=datetime.now()
             )
             embed.add_field(name="原名称", value=f"`{old_name}`", inline=True)
-            embed.add_field(name="新名称", value=f"`{new_name}`", inline=True)
+            embed.add_field(name="新名称", value=f"`{final_name}`", inline=True)
             embed.add_field(name="操作者", value=interaction.user.mention, inline=True)
+            if emoji:
+                embed.add_field(name="自定义Emoji", value=emoji, inline=True)
+            else:
+                embed.add_field(name="默认Emoji", value=self.default_emoji, inline=True)
             embed.set_footer(text="注意: Discord API 限制每个频道每10分钟最多修改2次名称")
             
             await interaction.followup.send(embed=embed)
             
             # 记录日志
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-                  f"频道名称已修改: {old_name} → {new_name} "
+                  f"频道名称已修改: {old_name} → {final_name} "
                   f"(操作者: {interaction.user.name})")
             
         except asyncio.TimeoutError:

@@ -31,6 +31,7 @@ class HumanoidBot(commands.Bot):
         
         self.initial_extensions = [
             'cogs.channel_manager',
+            'cogs.message_cleaner',
         ]
         
     async def setup_hook(self):
@@ -74,7 +75,7 @@ class HumanoidBot(commands.Bot):
         
         # 设置 Bot 状态
         await self.change_presence(
-            activity=discord.Game(name="使用 /改改的名 修改频道")
+            activity=discord.Game(name="使用 /改改的名 修改频道 | /一键冲水 删除消息")
         )
     
     async def on_config_reload(self):
