@@ -192,7 +192,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                         await channel.delete_messages(message_ids)
                     except Exception as e:
                         for message_id in message_ids:
-                            await channel.delete_messages(message_id)
+                            await channel.delete_messages([message_id])
                     progress_data['deleted'] += len(message_ids)
                     progress_data['last_delete_time'] = datetime.now()
                 
