@@ -46,14 +46,14 @@ class HumanoidBot(commands.Bot):
             except Exception as e:
                 print(f"  ✗ 加载失败 {extension}: {e}")
         
-        # 同步斜杠命令到 Discord
+        '''# 同步斜杠命令到 Discord
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 正在同步斜杠命令...")
         try:
             synced = await self.tree.sync()
             print(f"  ✓ 已同步 {len(synced)} 个斜杠命令")
         except Exception as e:
             print(f"  ✗ 命令同步失败: {e}")
-        
+        '''
         # 启动配置文件监控
         if self.config_loader.get('hot_reload.enabled', True):
             interval = self.config_loader.get('hot_reload.watch_interval', 2)
@@ -75,7 +75,7 @@ class HumanoidBot(commands.Bot):
         
         # 设置 Bot 状态
         await self.change_presence(
-            activity=discord.Game(name="使用 /改改的名 修改频道 | /一键冲水 删除消息")
+            activity=discord.Game(name="使用 /改改的名 修改频道")
         )
     
     async def on_config_reload(self):
