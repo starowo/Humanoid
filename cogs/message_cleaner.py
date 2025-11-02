@@ -188,8 +188,14 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                     channel = self.bot.get_channel(channel_id)
                     if not channel:
                         channel = await self.bot.fetch_channel(channel_id)
-                    await channel.delete_messages(message_ids)
-                    
+                    try:
+                        await channel.delete_messages(message_ids)
+                    except Exception as e:
+                        for message_id in message_ids:
+                            try:
+                                await channel.delete_messages(message_id)
+                            except Exception as e:
+                                progress_data['forbidden'] += 1
                     progress_data['deleted'] += len(message_ids)
                     progress_data['last_delete_time'] = datetime.now()
                 
