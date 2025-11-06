@@ -188,18 +188,25 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                     channel = self.bot.get_channel(channel_id)
                     if not channel:
                         channel = await self.bot.fetch_channel(channel_id)
+                    should_archive = False
+                    if channel.archived:
+                        should_archive = True
+                        await channel.edit(archived=False)
                     try:
                         await channel.delete_messages(message_ids)
+                        print(f"删除消息成功: {message_ids}")
                     except Exception as e:
                         for message_id in message_ids:
                             try:
                                 await channel.delete_messages([message_id])
+                                print(f"删除消息成功: {message_id}")
                             except Exception as e:
+                                print(f"删除消息失败: {e}")
                                 progress_data['forbidden'] += 1
+                    if should_archive:
+                        await channel.edit(archived=True)
                     progress_data['deleted'] += len(message_ids)
                     progress_data['last_delete_time'] = datetime.now()
-                
-                await asyncio.sleep(10)
 
             except Exception as e:
                 progress_data['error'] = f'删除错误: {str(e)}'
@@ -314,7 +321,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
         self, 
         interaction: discord.Interaction, 
         用户: discord.Member,
-        频道: Optional[discord.TextChannel] = None
+        频道: Optional[discord.abc.GuildChannel] = None
     ):
         """一键冲水命令"""
         
