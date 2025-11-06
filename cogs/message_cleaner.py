@@ -189,7 +189,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                     if not channel:
                         channel = await self.bot.fetch_channel(channel_id)
                     should_archive = False
-                    if channel.archived:
+                    if isinstance(channel, discord.Thread) and channel.archived:
                         should_archive = True
                         await channel.edit(archived=False)
                     try:
