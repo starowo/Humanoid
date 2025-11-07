@@ -195,18 +195,22 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                     try:
                         await channel.delete_messages(message_ids)
                         print(f"删除消息成功: {message_ids}")
+                        
+                        progress_data['deleted'] += len(message_ids)
+                        progress_data['last_delete_time'] = datetime.now()
                     except Exception as e:
                         for message_id in message_ids:
                             try:
                                 await channel.delete_messages([message_id])
                                 print(f"删除消息成功: {message_id}")
+                                progress_data['deleted'] += 1
+                                progress_data['last_delete_time'] = datetime.now()
                             except Exception as e:
                                 print(f"删除消息失败: {e}")
                                 progress_data['forbidden'] += 1
+                                progress_data['last_delete_time'] = datetime.now()
                     if should_archive:
                         await channel.edit(archived=True)
-                    progress_data['deleted'] += len(message_ids)
-                    progress_data['last_delete_time'] = datetime.now()
 
             except Exception as e:
                 progress_data['error'] = f'删除错误: {str(e)}'
