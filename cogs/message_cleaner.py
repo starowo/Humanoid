@@ -56,6 +56,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
             'Content-Type': 'application/json'
         }
         
+        total_messages = -1
         current_max_id = -1
         search_count = 0
         
@@ -86,10 +87,19 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                             messages = data.get('messages', [])
                             
                             if not messages:
-                                # 没有更多消息了
-                                progress_data['search_finished'] = True
-                                break
-                            
+                                if progress_data.get('searched', 0) >= total_messages:
+                                    # 没有更多消息了
+                                    progress_data['search_finished'] = True
+                                    break
+                                else:
+                                    if progress_data.get('search_paused', 0) >= 3:
+                                        progress_data['search_finished'] = True
+                                        break
+                                    progress_data['search_paused'] = progress_data.get('search_paused', 0) + 1
+                                    await asyncio.sleep(15)
+                                    continue
+                            if total_messages == -1:
+                                total_messages = data.get('total_results', 0)
                             # 处理搜索结果
                             found_count = 0
                             for message_group in messages:
@@ -101,12 +111,19 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                                     if channel_id == message_id:
                                         # 跳过帖子首楼
                                         progress_data['skipped_threads'] += 1
+                                        found_count += 1
+                                        if message_id < current_max_id or current_max_id == -1:
+                                            current_max_id = message_id
                                         continue
 
                                     # 检查是否被标注
                                     if message.get('pinned', False):
                                         # 跳过被标注的消息
                                         progress_data['skipped_pinned'] += 1
+                                        found_count += 1
+                                        
+                                        if message_id < current_max_id or current_max_id == -1:
+                                            current_max_id = message_id
                                         continue
 
                                     # 添加到队列
@@ -128,8 +145,17 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
 
                             # 搜不到则退出
                             if found_count == 0:
-                                progress_data['search_finished'] = True
-                                break
+                                if progress_data.get('searched', 0) >= total_messages:
+                                    # 没有更多消息了
+                                    progress_data['search_finished'] = True
+                                    break
+                                else:
+                                    if progress_data.get('search_paused', 0) >= 3:
+                                        progress_data['search_finished'] = True
+                                        break
+                                    progress_data['search_paused'] = progress_data.get('search_paused', 0) + 1
+                                    await asyncio.sleep(15)
+                                    continue
                             
                             # 检查是否达到最大消息数
                             if progress_data['searched'] >= self.max_messages:
@@ -314,6 +340,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                 
             except Exception as e:
                 print(f"更新进度失败: {e}")
+                message = await message.channel.fetch_message(message.id)
                 await asyncio.sleep(5)
     
     @app_commands.command(name="一键冲水", description="删除指定用户在指定范围内的所有消息")
