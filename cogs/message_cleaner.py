@@ -47,19 +47,20 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
         member_role_ids = [role.id for role in member.roles]
         return any(role_id in member_role_ids for role_id in self.allowed_role_ids)
     
-    async def search_messages(self, guild_id: int, author_id: int, channel_id: Optional[int], 
-                             message_queue: deque, stop_event: asyncio.Event, 
-                             progress_data: dict):
+    async def search_messages(self, guild_id: int, author_id: int, channel_id: Optional[int],
+                             message_queue: deque, stop_event: asyncio.Event,
+                             progress_data: dict, sort_order: str = "desc"):
         """搜索消息的协程"""
         headers = {
             'Authorization': self.user_token,
             'Content-Type': 'application/json'
         }
-        
+
         total_messages = -1
-        current_max_id = -1
+        # desc 模式跟踪最小 ID（最旧），asc 模式跟踪最大 ID（最新）
+        current_pivot_id = -1
         search_count = 0
-        
+
         async with aiohttp.ClientSession() as session:
             while not stop_event.is_set():
                 try:
@@ -68,27 +69,29 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                         f"https://discord.com/api/v9/guilds/{guild_id}/messages/search"
                         f"?author_id={author_id}"
                         f"&sort_by=timestamp"
-                        f"&sort_order=desc"
+                        f"&sort_order={sort_order}"
                         f"&offset=0"
                         f"&include_nsfw=true"
                     )
-                    
+
                     # 如果指定了频道，添加频道参数
                     if channel_id:
                         url += f"&channel_id={channel_id}"
-                    
-                    if current_max_id != -1:
-                        url += f"&max_id={current_max_id}"
-                    
+
+                    if current_pivot_id != -1:
+                        if sort_order == "desc":
+                            url += f"&max_id={current_pivot_id}"
+                        else:
+                            url += f"&min_id={current_pivot_id}"
+
                     # 发送请求
                     async with session.get(url, headers=headers) as response:
                         if response.status == 200:
                             data = await response.json()
                             messages = data.get('messages', [])
-                            
+
                             if not messages:
                                 if progress_data.get('searched', 0) >= total_messages:
-                                    # 没有更多消息了
                                     progress_data['search_finished'] = True
                                     break
                                 else:
@@ -98,47 +101,48 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                                     progress_data['search_paused'] = progress_data.get('search_paused', 0) + 1
                                     await asyncio.sleep(15)
                                     continue
+
                             if total_messages == -1:
                                 total_messages = data.get('total_results', 0)
+
                             # 处理搜索结果
                             found_count = 0
                             for message_group in messages:
                                 for message in message_group:
                                     message_id = int(message['id'])
-                                    channel_id = int(message['channel_id'])
-                                    
+                                    msg_channel_id = int(message['channel_id'])
+
+                                    # 更新分页游标
+                                    if sort_order == "desc":
+                                        # 跟踪最旧（最小）消息 ID
+                                        if message_id < current_pivot_id or current_pivot_id == -1:
+                                            current_pivot_id = message_id
+                                    else:
+                                        # 跟踪最新（最大）消息 ID
+                                        if message_id > current_pivot_id or current_pivot_id == -1:
+                                            current_pivot_id = message_id
+
                                     # 检查是否是帖子首楼
-                                    if channel_id == message_id:
-                                        # 跳过帖子首楼
+                                    if msg_channel_id == message_id:
                                         progress_data['skipped_threads'] += 1
                                         found_count += 1
-                                        if message_id < current_max_id or current_max_id == -1:
-                                            current_max_id = message_id
                                         continue
 
                                     # 检查是否被标注
                                     if message.get('pinned', False):
-                                        # 跳过被标注的消息
                                         progress_data['skipped_pinned'] += 1
                                         found_count += 1
-                                        
-                                        if message_id < current_max_id or current_max_id == -1:
-                                            current_max_id = message_id
                                         continue
 
                                     # 添加到队列
                                     message_info = {
                                         'id': message_id,
-                                        'channel_id': int(message['channel_id']),
-                                        'content': message.get('content', '')[:50]  # 只保存前50个字符
+                                        'channel_id': msg_channel_id,
+                                        'content': message.get('content', '')[:50]
                                     }
                                     message_queue.append(message_info)
                                     found_count += 1
-                                    
-                                    # 更新 max_id 为最旧的消息 ID
-                                    if message_id < current_max_id or current_max_id == -1:
-                                        current_max_id = message_id
-                            
+
                             search_count += 1
                             progress_data['searched'] += found_count
                             progress_data['last_search_time'] = datetime.now()
@@ -146,7 +150,6 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                             # 搜不到则退出
                             if found_count == 0:
                                 if progress_data.get('searched', 0) >= total_messages:
-                                    # 没有更多消息了
                                     progress_data['search_finished'] = True
                                     break
                                 else:
@@ -156,36 +159,33 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                                     progress_data['search_paused'] = progress_data.get('search_paused', 0) + 1
                                     await asyncio.sleep(15)
                                     continue
-                            
+
                             # 检查是否达到最大消息数
                             if progress_data['searched'] >= self.max_messages:
                                 progress_data['search_finished'] = True
                                 break
-                            
+
                         elif response.status == 429:
-                            # 速率限制
                             retry_after = int(response.headers.get('Retry-After', 10))
                             progress_data['rate_limited'] = True
                             await asyncio.sleep(retry_after)
                             progress_data['rate_limited'] = False
-                            
+
                         elif response.status == 401:
-                            # Token 无效
                             progress_data['error'] = 'User Token 无效，请检查配置'
                             break
-                            
+
                         else:
-                            # 其他错误
                             progress_data['error'] = f'API 错误: {response.status}'
                             break
-                    
+
                     # 等待下一次搜索
                     await asyncio.sleep(self.search_interval)
-                    
+
                 except Exception as e:
                     progress_data['error'] = f'搜索错误: {str(e)}'
                     break
-        
+
         progress_data['search_finished'] = True
     
     async def delete_messages(self, message_queue: deque, stop_event: asyncio.Event, 
@@ -345,17 +345,25 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
     
     @app_commands.command(name="一键冲水", description="删除指定用户在指定范围内的所有消息")
     @app_commands.describe(
-        用户="要删除消息的用户",
-        频道="指定频道（留空则搜索整个服务器）"
+        用户="要删除消息的用户（服务器成员）",
+        用户ID="要删除消息的用户 ID（支持不在服务器的用户，与「用户」二选一）",
+        频道="指定频道（留空则搜索整个服务器）",
+        排序方式="搜索顺序，默认从新到旧"
     )
+    @app_commands.choices(排序方式=[
+        app_commands.Choice(name="从新到旧", value="desc"),
+        app_commands.Choice(name="从旧到新", value="asc"),
+    ])
     async def flush_messages(
-        self, 
-        interaction: discord.Interaction, 
-        用户: discord.Member,
-        频道: Optional[discord.abc.GuildChannel] = None
+        self,
+        interaction: discord.Interaction,
+        用户: Optional[discord.Member] = None,
+        用户ID: Optional[str] = None,
+        频道: Optional[discord.abc.GuildChannel] = None,
+        排序方式: str = "desc"
     ):
         """一键冲水命令"""
-        
+
         # 检查用户权限
         if not self.check_role_permission(interaction.user):
             await interaction.response.send_message(
@@ -363,7 +371,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                 ephemeral=True
             )
             return
-        
+
         # 检查 User Token
         if not self.user_token:
             await interaction.response.send_message(
@@ -371,28 +379,62 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                 ephemeral=True
             )
             return
-        
+
+        # 至少需要提供「用户」或「用户ID」之一
+        if 用户 is None and 用户ID is None:
+            await interaction.response.send_message(
+                "❌ 请提供「用户」或「用户ID」参数！",
+                ephemeral=True
+            )
+            return
+
+        # 解析目标用户 ID 及显示名
+        if 用户 is not None:
+            target_id = 用户.id
+            target_display = 用户.mention
+            target_name = 用户.name
+        else:
+            用户ID = 用户ID.strip()
+            if not 用户ID.isdigit():
+                await interaction.response.send_message(
+                    "❌ 用户 ID 格式无效，请输入纯数字 ID！",
+                    ephemeral=True
+                )
+                return
+            target_id = int(用户ID)
+            # 尝试从缓存获取用户信息，失败则只显示 ID
+            try:
+                fetched = await self.bot.fetch_user(target_id)
+                target_display = f"{fetched} (`{target_id}`)"
+                target_name = str(fetched)
+            except Exception:
+                target_display = f"`{target_id}`"
+                target_name = 用户ID
+
+        sort_label = "从旧到新 ⬆️" if 排序方式 == "asc" else "从新到旧 ⬇️"
+
         # 创建初始 Embed
         embed = discord.Embed(
             title="🚽 一键冲水启动中...",
             color=discord.Color.blue(),
             timestamp=datetime.now()
         )
-        embed.add_field(name="目标用户", value=用户.mention, inline=True)
+        embed.add_field(name="目标用户", value=target_display, inline=True)
         embed.add_field(
-            name="搜索范围", 
-            value=频道.mention if 频道 else "整个服务器", 
+            name="搜索范围",
+            value=频道.mention if 频道 else "整个服务器",
             inline=True
         )
-        
+        embed.add_field(name="排序方式", value=sort_label, inline=True)
+
         await interaction.response.send_message(embed=embed)
         message = await interaction.original_response()
-        
+
         # 创建任务数据
-        task_id = f"{interaction.guild.id}_{用户.id}_{datetime.now().timestamp()}"
+        task_id = f"{interaction.guild.id}_{target_id}_{datetime.now().timestamp()}"
         message_queue = deque()
         stop_event = asyncio.Event()
-        
+
         progress_data = {
             'searched': 0,
             'deleted': 0,
@@ -400,6 +442,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
             'not_found': 0,
             'delete_errors': 0,
             'skipped_threads': 0,
+            'skipped_pinned': 0,
             'search_finished': False,
             'rate_limited': False,
             'finished': False,
@@ -408,19 +451,20 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
             'last_delete_time': None,
             'error': None
         }
-        
+
         # 启动搜索和删除任务
         search_task = asyncio.create_task(
             self.search_messages(
                 interaction.guild.id,
-                用户.id,
+                target_id,
                 频道.id if 频道 else None,
                 message_queue,
                 stop_event,
-                progress_data
+                progress_data,
+                排序方式
             )
         )
-        
+
         delete_task = asyncio.create_task(
             self.delete_messages(
                 message_queue,
@@ -429,7 +473,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                 interaction
             )
         )
-        
+
         progress_task = asyncio.create_task(
             self.update_progress_embed(
                 interaction,
@@ -437,7 +481,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                 message
             )
         )
-        
+
         # 保存任务信息
         self.active_tasks[task_id] = {
             'search_task': search_task,
@@ -446,7 +490,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
             'stop_event': stop_event,
             'progress_data': progress_data
         }
-        
+
         # 等待任务完成
         try:
             await asyncio.gather(search_task, delete_task)
@@ -456,30 +500,32 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
             progress_data['finished'] = True
             await asyncio.sleep(1)  # 等待最后一次进度更新
             progress_task.cancel()
-            
+
             # 发送完成消息
             final_embed = discord.Embed(
                 title="✅ 一键冲水完成！",
                 color=discord.Color.green(),
                 timestamp=datetime.now()
             )
-            final_embed.add_field(name="目标用户", value=用户.mention, inline=True)
+            final_embed.add_field(name="目标用户", value=target_display, inline=True)
+            final_embed.add_field(name="排序方式", value=sort_label, inline=True)
             final_embed.add_field(name="已搜索", value=f"`{progress_data['searched']}` 条", inline=True)
             final_embed.add_field(name="已删除", value=f"`{progress_data['deleted']}` 条", inline=True)
             final_embed.add_field(name="无法删除", value=f"`{progress_data['forbidden']}` 条", inline=True)
             final_embed.add_field(name="跳过帖子", value=f"`{progress_data['skipped_threads']}` 条", inline=True)
-            
+
             if progress_data.get('error'):
                 final_embed.add_field(name="错误", value=progress_data['error'], inline=False)
-            
+
             await message.edit(embed=final_embed)
-            
+
             # 清理任务
             del self.active_tasks[task_id]
-            
+
             # 记录日志
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-                  f"一键冲水完成: 用户={用户.name}, "
+                  f"一键冲水完成: 用户={target_name}, "
+                  f"排序={sort_label}, "
                   f"搜索={progress_data['searched']}, "
                   f"删除={progress_data['deleted']} "
                   f"(操作者: {interaction.user.name})")
