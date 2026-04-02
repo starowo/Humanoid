@@ -13,6 +13,7 @@ import aiohttp
 import json
 import base64
 import time
+import re
 
 
 class AICustomerService(commands.Cog, name="AI客服"):
@@ -25,6 +26,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.active_channels: set[int] = set()
         self.processing_channels: set[int] = set()
         self.pending_messages: dict[int, list[discord.Message]] = {}
+        self.debug_channels: set[int] = set()
         self.session: Optional[aiohttp.ClientSession] = None
         self.load_config()
 
@@ -125,6 +127,20 @@ class AICustomerService(commands.Cog, name="AI客服"):
                     "parameters": {
                         "type": "OBJECT",
                         "properties": {}
+                    }
+                },
+                {
+                    "name": "fetch_messages",
+                    "description": "根据 Discord 消息链接获取该消息前后各25条聊天记录，用于查看用户提供的消息链接上下文",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "message_link": {
+                                "type": "STRING",
+                                "description": "Discord 消息链接，格式如 https://discord.com/channels/服务器ID/频道ID/消息ID"
+                            }
+                        },
+                        "required": ["message_link"]
                     }
                 }
             ]
@@ -342,6 +358,41 @@ class AICustomerService(commands.Cog, name="AI客服"):
         if name == 'exit_conversation':
             return {"result": "对话已结束"}
 
+        if name == 'fetch_messages':
+            link = args.get('message_link', '')
+            match = re.search(r'channels/(\d+)/(\d+)/(\d+)', link)
+            if not match:
+                return {"error": "无效的消息链接格式"}
+
+            ch_id, msg_id = int(match.group(2)), int(match.group(3))
+            try:
+                target_ch = self.bot.get_channel(ch_id)
+                if not target_ch:
+                    target_ch = await self.bot.fetch_channel(ch_id)
+                target_msg = await target_ch.fetch_message(msg_id)
+            except Exception:
+                return {"error": "无法获取目标消息，可能无权限或消息不存在"}
+
+            msgs_before = []
+            async for m in target_ch.history(limit=25, before=target_msg):
+                msgs_before.append(m)
+            msgs_before.reverse()
+
+            msgs_after = []
+            async for m in target_ch.history(limit=25, after=target_msg):
+                msgs_after.append(m)
+
+            all_msgs = msgs_before + [target_msg] + msgs_after
+            lines = []
+            for m in all_msgs:
+                marker = ">>>" if m.id == msg_id else "   "
+                ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                text = m.content or "(无文本)"
+                atts = f" [附件: {', '.join(a.filename for a in m.attachments)}]" if m.attachments else ""
+                lines.append(f"{marker} [{ts}] {m.author.display_name} ({m.author.id}): {text}{atts}")
+
+            return {"messages": "\n".join(lines)}
+
         return {"error": f"未知工具: {name}"}
 
     # ── 响应生成（含工具调用循环） ────────────────────────────
@@ -414,10 +465,30 @@ class AICustomerService(commands.Cog, name="AI客服"):
                     self.conversations.pop(channel_id, None)
                     return
 
-                try:
-                    await bot_message.edit(content="💭 处理中...")
-                except discord.HTTPException:
-                    pass
+                # debug 模式：显示工具调用详情
+                if channel_id in self.debug_channels:
+                    debug_lines = ["**[DEBUG] 工具调用**"]
+                    for tc_part in result['tool_call_parts']:
+                        fc = tc_part['functionCall']
+                        args_str = json.dumps(fc.get('args', {}), ensure_ascii=False)
+                        debug_lines.append(f"🔧 `{fc['name']}({args_str})`")
+                    for fr in func_resp_parts:
+                        fr_data = fr['functionResponse']
+                        resp_str = json.dumps(fr_data['response'], ensure_ascii=False)
+                        if len(resp_str) > 500:
+                            resp_str = resp_str[:500] + "..."
+                        debug_lines.append(f"📤 `{fr_data['name']}` → {resp_str}")
+                    debug_text = "\n".join(debug_lines)
+                    await channel.send(debug_text[:2000])
+
+                # 已有文本时保留当前消息，新建消息用于后续回复
+                if result.get('text'):
+                    bot_message = await channel.send("💭 处理中...")
+                else:
+                    try:
+                        await bot_message.edit(content="💭 处理中...")
+                    except discord.HTTPException:
+                        pass
                 continue
 
             # type == 'empty'
@@ -630,6 +701,26 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 pass
         finally:
             self.processing_channels.discard(channel_id)
+
+    @app_commands.command(name="ai调试", description="开启或关闭当前频道的AI客服调试模式")
+    @app_commands.describe(操作="开启或关闭调试模式")
+    @app_commands.choices(操作=[
+        app_commands.Choice(name="开启", value="on"),
+        app_commands.Choice(name="关闭", value="off"),
+    ])
+    async def toggle_debug(self, interaction: discord.Interaction, 操作: str):
+        """开关调试模式，显示完整工具调用信息"""
+        if not isinstance(interaction.user, discord.Member) or not self._is_admin(interaction.user):
+            await interaction.response.send_message("❌ 你没有权限使用此命令", ephemeral=True)
+            return
+
+        channel_id = interaction.channel.id
+        if 操作 == "on":
+            self.debug_channels.add(channel_id)
+            await interaction.response.send_message("🐛 调试模式已开启", ephemeral=True)
+        else:
+            self.debug_channels.discard(channel_id)
+            await interaction.response.send_message("🐛 调试模式已关闭", ephemeral=True)
 
 
 async def setup(bot):
