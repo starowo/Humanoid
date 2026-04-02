@@ -144,8 +144,12 @@ class AICustomerService(commands.Cog, name="AI客服"):
         parts = []
         image_links: list[str] = []
 
+        author = message.author
+        user_tag = f"<odyxml:user name=\"{author.display_name}\" id=\"{author.id}\">"
         if message.content:
-            parts.append({"text": message.content})
+            parts.append({"text": f"{user_tag}\n{message.content}"})
+        else:
+            parts.append({"text": user_tag})
 
         for attachment in message.attachments:
             if attachment.size > self.max_attachment_size:
@@ -197,8 +201,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
             )
             parts.append({"text": link_tags})
 
-        if not parts:
-            parts.append({"text": "(空消息)"})
+        parts.append({"text": "</odyxml:user>"})
 
         return {"role": "user", "parts": parts}
 
