@@ -27,6 +27,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.processing_channels: set[int] = set()
         self.pending_messages: dict[int, list[discord.Message]] = {}
         self.debug_channels: set[int] = set()
+        self.generation_tasks: dict[int, asyncio.Task] = {}
         self.session: Optional[aiohttp.ClientSession] = None
         self.load_config()
 
@@ -236,6 +237,11 @@ class AICustomerService(commands.Cog, name="AI客服"):
             "contents": history,
             "systemInstruction": self._build_system_instruction(),
             "tools": self._build_tools(),
+            "generationConfig": {
+                "thinkingConfig": {
+                    "includeThoughts": True,
+                },
+            },
         }
 
         url = (
@@ -257,12 +263,12 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 headers={"Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=300),
             )
-            if resp.status == 429:
+            if resp.status in (429, 524):
                 resp.release()
                 retry_after = int(resp.headers.get('Retry-After', 10))
                 if attempt < max_retries - 1:
                     try:
-                        await bot_message.edit(content=f"⏳ API 限流，{retry_after}秒后重试...")
+                        await bot_message.edit(content=f"⏳ API 限流/过载，{retry_after}秒后重试...")
                     except discord.HTTPException:
                         pass
                     await asyncio.sleep(retry_after)
@@ -311,6 +317,9 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 parts = content.get('parts', [])
 
                 for part in parts:
+                    # 跳过思考摘要 part，不显示也不记录
+                    if part.get('thought'):
+                        continue
                     if 'functionCall' in part:
                         fc_part = {'functionCall': part['functionCall']}
                         if 'thoughtSignature' in part:
@@ -515,42 +524,64 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
     # ── 消息处理入口 ──────────────────────────────────────────
 
-    async def _append_and_respond(self, channel, channel_id: int, messages: list[discord.Message]):
-        """将一批用户消息合并为一条 user turn 加入历史，然后生成回复"""
+    async def _run_generation(self, channel, channel_id: int, messages: list[discord.Message]):
+        """构建 user turn、发起可取消的生成任务"""
         if channel_id not in self.conversations:
             self.conversations[channel_id] = []
 
-        # 多条消息的 parts 合并成单条 user message（Gemini 不允许连续 user turn）
         combined_parts = []
         for msg in messages:
             user_msg = await self._build_user_message(msg)
             combined_parts.extend(user_msg["parts"])
 
+        # 记录插入点，取消时据此回滚
+        rollback_index = len(self.conversations[channel_id])
         self.conversations[channel_id].append({"role": "user", "parts": combined_parts})
 
         if len(self.conversations[channel_id]) > self.max_history:
             self.conversations[channel_id] = self.conversations[channel_id][-self.max_history:]
+            rollback_index = max(0, rollback_index - (len(combined_parts)))
 
         bot_message = await channel.send("💭 思考中...")
-        await self._generate_response(channel, channel_id, bot_message)
+
+        gen_task = asyncio.create_task(
+            self._generate_response(channel, channel_id, bot_message)
+        )
+        self.generation_tasks[channel_id] = gen_task
+
+        try:
+            await gen_task
+        except asyncio.CancelledError:
+            try:
+                await bot_message.delete()
+            except discord.HTTPException:
+                pass
+            # 回滚：移除本轮 user turn 及所有不完整的 model/function 响应
+            convos = self.conversations.get(channel_id, [])
+            del convos[rollback_index:]
 
     async def _handle_message(self, message: discord.Message):
         channel = message.channel
         channel_id = channel.id
 
-        # 频道正忙时排队，等当前回复结束后再处理
         if channel_id in self.processing_channels:
             self.pending_messages.setdefault(channel_id, []).append(message)
+            # 中断当前生成
+            task = self.generation_tasks.get(channel_id)
+            if task and not task.done():
+                task.cancel()
             return
 
         self.processing_channels.add(channel_id)
         try:
-            await self._append_and_respond(channel, channel_id, [message])
-
-            # 处理排队期间累积的消息
-            while channel_id in self.active_channels and self.pending_messages.get(channel_id):
-                queued = self.pending_messages.pop(channel_id)
-                await self._append_and_respond(channel, channel_id, queued)
+            msgs = [message]
+            while msgs:
+                await self._run_generation(channel, channel_id, msgs)
+                msgs = (
+                    self.pending_messages.pop(channel_id)
+                    if channel_id in self.active_channels and self.pending_messages.get(channel_id)
+                    else None
+                )
 
         except Exception as e:
             print(
@@ -564,6 +595,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
         finally:
             self.processing_channels.discard(channel_id)
             self.pending_messages.pop(channel_id, None)
+            self.generation_tasks.pop(channel_id, None)
 
     # ── 事件监听 ──────────────────────────────────────────────
 
