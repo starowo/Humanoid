@@ -5,7 +5,7 @@ AI客服模块
 import discord
 from discord import app_commands
 from discord.ext import commands
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from pathlib import Path
 import asyncio
@@ -95,7 +95,9 @@ class AICustomerService(commands.Cog, name="AI客服"):
     # ── API 请求构建 ──────────────────────────────────────────
 
     def _build_system_instruction(self) -> dict:
-        prompt = self.system_prompt
+        beijing_now = datetime.now(timezone(timedelta(hours=8)))
+        time_tag = f"<time>{beijing_now.strftime('%Y-%m-%d %H:%M:%S')}</time>\n"
+        prompt = time_tag + self.system_prompt
         if self.tail_prompt:
             prompt += f"\n\n---\n{self.tail_prompt}"
         return {"parts": [{"text": prompt}]}
@@ -603,7 +605,18 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 ephemeral=True,
             )
 
-            bot_message = await channel.send("💭 思考中...")
+            # 找到最近的投诉人（非 bot、非管理组）并 @ 提醒，再编辑为思考中
+            mention_user = None
+            async for msg in channel.history(limit=50):
+                if not msg.author.bot and isinstance(msg.author, discord.Member) and not self._is_admin(msg.author):
+                    mention_user = msg.author
+                    break
+
+            if mention_user:
+                bot_message = await channel.send(mention_user.mention)
+                await bot_message.edit(content="💭 思考中...")
+            else:
+                bot_message = await channel.send("💭 思考中...")
             await self._generate_response(channel, channel_id, bot_message)
 
         except Exception as e:
