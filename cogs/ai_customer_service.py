@@ -111,6 +111,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.pending_messages: dict[int, list[discord.Message]] = {}
         self.debug_channels: set[int] = set()
         self.generation_tasks: dict[int, asyncio.Task] = {}
+        self.channel_complainants: dict[int, int] = {}  # channel_id -> 原始投诉人 user_id
         self.session: Optional[aiohttp.ClientSession] = None
         self.load_config()
 
@@ -226,6 +227,14 @@ class AICustomerService(commands.Cog, name="AI客服"):
                         },
                         "required": ["message_link"]
                     }
+                },
+                {
+                    "name": "no_response",
+                    "description": "决定不回复当前消息，静默处理。适用于无需AI回应的场景（如用户闲聊、无关内容等）",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {}
+                    }
                 }
             ]
         }]
@@ -247,7 +256,9 @@ class AICustomerService(commands.Cog, name="AI客服"):
         image_links: list[str] = []
 
         author = message.author
-        user_tag = f"<odyxml:user name=\"{author.display_name}\" id=\"{author.id}\">"
+        is_admin = isinstance(author, discord.Member) and self._is_admin(author)
+        role_attr = ' role="admin"' if is_admin else ''
+        user_tag = f"<odyxml:user name=\"{author.display_name}\" id=\"{author.id}\"{role_attr}>"
         if message.content:
             parts.append({"text": f"{user_tag}\n{message.content}"})
         else:
@@ -466,6 +477,9 @@ class AICustomerService(commands.Cog, name="AI客服"):
         if name == 'exit_conversation':
             return {"result": "对话已结束"}
 
+        if name == 'no_response':
+            return {"result": "已静默处理"}
+
         if name == 'fetch_messages':
             link = args.get('message_link', '')
             match = re.search(r'channels/(\d+)/(\d+)/(\d+)', link)
@@ -544,6 +558,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 # 逐个执行工具并收集结果
                 func_resp_parts = []
                 exit_called = False
+                no_response_called = False
 
                 for tc_part in result['tool_call_parts']:
                     fc = tc_part['functionCall']
@@ -556,12 +571,21 @@ class AICustomerService(commands.Cog, name="AI客服"):
                     })
                     if fc['name'] == 'exit_conversation':
                         exit_called = True
+                    elif fc['name'] == 'no_response':
+                        no_response_called = True
 
                 # 将工具结果加入历史
                 self.conversations[channel_id].append({
                     "role": "user",
                     "parts": func_resp_parts,
                 })
+
+                if no_response_called:
+                    try:
+                        await bot_message.delete()
+                    except discord.HTTPException:
+                        pass
+                    return
 
                 if exit_called:
                     final = result.get('text') or '对话已结束，感谢您的使用！'
@@ -571,6 +595,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
                         pass
                     self.active_channels.discard(channel_id)
                     self.conversations.pop(channel_id, None)
+                    self.channel_complainants.pop(channel_id, None)
                     return
 
                 # debug 模式：显示工具调用详情
@@ -644,13 +669,39 @@ class AICustomerService(commands.Cog, name="AI客服"):
             convos = self.conversations.get(channel_id, [])
             del convos[rollback_index:]
 
+    async def _record_only(self, channel_id: int, message: discord.Message):
+        """仅将消息记入对话历史，不触发 AI 回复"""
+        if channel_id not in self.conversations:
+            self.conversations[channel_id] = []
+        user_msg = await self._build_user_message(message)
+        self.conversations[channel_id].append(user_msg)
+        if len(self.conversations[channel_id]) > self.max_history:
+            self.conversations[channel_id] = self.conversations[channel_id][-self.max_history:]
+
+    def _is_complainant(self, channel_id: int, user_id: int) -> bool:
+        """判断是否为该频道的原始投诉人"""
+        if channel_id not in self.channel_complainants:
+            self.channel_complainants[channel_id] = user_id
+            return True
+        return self.channel_complainants[channel_id] == user_id
+
     async def _handle_message(self, message: discord.Message):
         channel = message.channel
         channel_id = channel.id
+        is_admin = isinstance(message.author, discord.Member) and self._is_admin(message.author)
+
+        # 非原始投诉人且非管理组：仅记录不回复
+        if not is_admin and not self._is_complainant(channel_id, message.author.id):
+            await self._record_only(channel_id, message)
+            return
+
+        # 管理组成员的可见消息也仅记录不回复（管理组通过 /ai管理 或按钮发隐藏指令）
+        if is_admin:
+            await self._record_only(channel_id, message)
+            return
 
         if channel_id in self.processing_channels:
             self.pending_messages.setdefault(channel_id, []).append(message)
-            # 中断当前生成
             task = self.generation_tasks.get(channel_id)
             if task and not task.done():
                 task.cancel()
@@ -718,6 +769,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
     async def on_guild_channel_delete(self, channel):
         """频道删除时清理资源"""
         self.active_channels.discard(channel.id)
+        self.channel_complainants.pop(channel.id, None)
         self.conversations.pop(channel.id, None)
 
     @commands.Cog.listener()
@@ -765,6 +817,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
         else:
             self.active_channels.discard(channel_id)
             self.conversations.pop(channel_id, None)
+            self.channel_complainants.pop(channel_id, None)
             await interaction.response.send_message("✅ AI客服已在此频道关闭", ephemeral=True)
             print(
                 f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
