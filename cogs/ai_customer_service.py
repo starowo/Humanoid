@@ -16,6 +16,89 @@ import time
 import re
 
 
+class AdminInjectModal(discord.ui.Modal, title="向AI发送隐藏指令"):
+    """管理员快速注入指令的弹出表单"""
+    指令 = discord.ui.TextInput(
+        label="指令内容（投诉人不可见）",
+        style=discord.TextStyle.paragraph,
+        placeholder="输入要发送给AI的指令...",
+        required=True,
+    )
+
+    def __init__(self, cog: "AICustomerService", source_channel_id: int):
+        super().__init__()
+        self.cog = cog
+        self.source_channel_id = source_channel_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        channel_id = self.source_channel_id
+        channel = self.cog.bot.get_channel(channel_id)
+        if not channel:
+            await interaction.response.send_message("❌ 无法找到来源频道", ephemeral=True)
+            return
+        if channel_id not in self.cog.active_channels:
+            await interaction.response.send_message("❌ 该频道AI客服已关闭", ephemeral=True)
+            return
+        if channel_id in self.cog.processing_channels:
+            await interaction.response.send_message("⏳ 该频道正在处理中，请稍后重试", ephemeral=True)
+            return
+
+        msg_text = self.指令.value
+
+        self.cog.processing_channels.add(channel_id)
+        try:
+            if channel_id not in self.cog.conversations:
+                self.cog.conversations[channel_id] = []
+            self.cog.conversations[channel_id].append({
+                "role": "user",
+                "parts": [{"text": f"<odyxml:admin>{msg_text}</odyxml:admin>"}],
+            })
+
+            await interaction.response.send_message(
+                f"✅ 已向 <#{channel_id}> 注入指令\n> {msg_text}",
+                ephemeral=True,
+            )
+
+            mention_user = None
+            async for msg in channel.history(limit=50):
+                if not msg.author.bot and isinstance(msg.author, discord.Member) and not self.cog._is_admin(msg.author):
+                    mention_user = msg.author
+                    break
+
+            if mention_user:
+                bot_message = await channel.send(mention_user.mention)
+                await bot_message.edit(content="💭 思考中...")
+            else:
+                bot_message = await channel.send("💭 思考中...")
+
+            await self.cog._generate_response(channel, channel_id, bot_message)
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [AI客服] 表单注入错误: {e}")
+            try:
+                await channel.send(f"❌ AI回复出错: {str(e)[:200]}")
+            except Exception:
+                pass
+        finally:
+            self.cog.processing_channels.discard(channel_id)
+
+
+class AdminInjectView(discord.ui.View):
+    """附在管理频道消息上的快速指令按钮"""
+    def __init__(self, cog: "AICustomerService", source_channel_id: int):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.source_channel_id = source_channel_id
+
+    @discord.ui.button(label="发送指令", style=discord.ButtonStyle.primary, emoji="📝")
+    async def inject_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not self.cog._is_admin(interaction.user):
+            await interaction.response.send_message("❌ 你没有权限", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            AdminInjectModal(self.cog, self.source_channel_id)
+        )
+
+
 class AICustomerService(commands.Cog, name="AI客服"):
     """AI客服 Cog"""
 
@@ -376,7 +459,8 @@ class AICustomerService(commands.Cog, name="AI客服"):
                     admin_ch = await self.bot.fetch_channel(self.admin_channel_id)
                 except Exception:
                     return {"error": "无法访问管理频道"}
-            await admin_ch.send(f"**来自 <#{channel.id}>：**\n{msg_text}")
+            view = AdminInjectView(self, channel.id)
+            await admin_ch.send(f"**来自 <#{channel.id}>：**\n{msg_text}", view=view)
             return {"result": "消息已发送到管理频道"}
 
         if name == 'exit_conversation':
