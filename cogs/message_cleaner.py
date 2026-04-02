@@ -381,28 +381,19 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
         最近天数: Optional[int] = None
     ):
         """一键冲水命令"""
+        await interaction.response.defer()
 
         # 检查用户权限
         if not self.check_role_permission(interaction.user):
-            await interaction.response.send_message(
-                "❌ 你没有权限使用此命令！",
-                ephemeral=True
-            )
-            return
-
-        # 检查 User Token
-        if not self.user_token:
-            await interaction.response.send_message(
-                "❌ 未配置 User Token，请在配置文件中添加！",
-                ephemeral=True
+            await interaction.followup.send(
+                "❌ 你没有权限使用此命令！"
             )
             return
 
         # 至少需要提供「用户」或「用户ID」之一
         if 用户 is None and 用户ID is None:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ 请提供「用户」或「用户ID」参数！",
-                ephemeral=True
             )
             return
 
@@ -414,9 +405,8 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
         else:
             用户ID = 用户ID.strip()
             if not 用户ID.isdigit():
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "❌ 用户 ID 格式无效，请输入纯数字 ID！",
-                    ephemeral=True
                 )
                 return
             target_id = int(用户ID)
@@ -434,9 +424,8 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
         days_label = "不限"
         if 最近天数 is not None:
             if 最近天数 < 1:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "❌ 天数必须为正整数！",
-                    ephemeral=True
                 )
                 return
             cutoff_dt = datetime.utcnow() - timedelta(days=最近天数)
@@ -460,7 +449,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
         embed.add_field(name="排序方式", value=sort_label, inline=True)
         embed.add_field(name="时间范围", value=days_label, inline=True)
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
         message = await interaction.original_response()
 
         # 创建任务数据
