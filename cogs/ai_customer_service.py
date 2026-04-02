@@ -207,9 +207,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
     async def _call_gemini_stream(self, channel_id: int, bot_message: discord.Message) -> dict:
         """
         调用 Gemini 流式 API 并实时更新 bot 消息。
-        返回 {'type': 'text', 'text': ...}
-            | {'type': 'tool_calls', 'tool_calls': [...], 'text': ...}
-            | {'type': 'empty'}
+        返回中保留 thoughtSignature 以兼容 Gemini 2.5/3 系列模型。
         """
         history = self.conversations.get(channel_id, [])
 
@@ -225,9 +223,10 @@ class AICustomerService(commands.Cog, name="AI客服"):
         )
 
         full_text = ""
-        tool_calls = []
+        tool_call_parts: list[dict] = []
+        text_signature: str | None = None
         last_edit_time = 0.0
-        min_edit_interval = 1.0 / 3  # 限制 1 秒最多 3 次编辑
+        min_edit_interval = 1.0 / 3
 
         async with self.session.post(
             url,
@@ -257,7 +256,6 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 except json.JSONDecodeError:
                     continue
 
-                # 检查 promptFeedback（安全拦截）
                 if 'promptFeedback' in data:
                     block_reason = data['promptFeedback'].get('blockReason', '')
                     if block_reason:
@@ -269,7 +267,6 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
                 candidate = candidates[0]
 
-                # 检查 finishReason
                 finish_reason = candidate.get('finishReason', '')
                 if finish_reason == 'SAFETY':
                     raise Exception("回复被安全策略拦截")
@@ -278,8 +275,15 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 parts = content.get('parts', [])
 
                 for part in parts:
-                    if 'text' in part:
+                    if 'functionCall' in part:
+                        fc_part = {'functionCall': part['functionCall']}
+                        if 'thoughtSignature' in part:
+                            fc_part['thoughtSignature'] = part['thoughtSignature']
+                        tool_call_parts.append(fc_part)
+                    elif 'text' in part:
                         full_text += part['text']
+                        if 'thoughtSignature' in part:
+                            text_signature = part['thoughtSignature']
                         now = time.monotonic()
                         if now - last_edit_time >= min_edit_interval:
                             try:
@@ -290,10 +294,9 @@ class AICustomerService(commands.Cog, name="AI客服"):
                                 last_edit_time = now
                             except discord.HTTPException:
                                 pass
-                    elif 'functionCall' in part:
-                        tool_calls.append(part['functionCall'])
+                    elif 'thoughtSignature' in part:
+                        text_signature = part['thoughtSignature']
 
-        # 流式结束后做最终编辑
         if full_text:
             try:
                 display = full_text[:1997] + "..." if len(full_text) > 2000 else full_text
@@ -301,10 +304,15 @@ class AICustomerService(commands.Cog, name="AI客服"):
             except discord.HTTPException:
                 pass
 
-        if tool_calls:
-            return {'type': 'tool_calls', 'tool_calls': tool_calls, 'text': full_text}
+        if tool_call_parts:
+            return {
+                'type': 'tool_calls',
+                'tool_call_parts': tool_call_parts,
+                'text': full_text,
+                'text_signature': text_signature,
+            }
         if full_text:
-            return {'type': 'text', 'text': full_text}
+            return {'type': 'text', 'text': full_text, 'text_signature': text_signature}
         return {'type': 'empty'}
 
     # ── 工具执行 ──────────────────────────────────────────────
@@ -346,9 +354,12 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
             if result['type'] == 'text':
                 text = result['text']
+                text_part: dict = {"text": text}
+                if result.get('text_signature'):
+                    text_part['thoughtSignature'] = result['text_signature']
                 self.conversations[channel_id].append({
                     "role": "model",
-                    "parts": [{"text": text}]
+                    "parts": [text_part],
                 })
                 if len(text) > 2000:
                     for i in range(2000, len(text), 2000):
@@ -356,12 +367,11 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 break
 
             if result['type'] == 'tool_calls':
-                # 将模型的工具调用响应加入历史
-                model_parts = []
+                # 将模型的工具调用响应加入历史（保留 thoughtSignature）
+                model_parts: list[dict] = []
                 if result.get('text'):
                     model_parts.append({"text": result['text']})
-                for tc in result['tool_calls']:
-                    model_parts.append({"functionCall": tc})
+                model_parts.extend(result['tool_call_parts'])
                 self.conversations[channel_id].append({
                     "role": "model",
                     "parts": model_parts,
@@ -371,15 +381,16 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 func_resp_parts = []
                 exit_called = False
 
-                for tc in result['tool_calls']:
-                    tool_result = await self._execute_tool(tc, channel)
+                for tc_part in result['tool_call_parts']:
+                    fc = tc_part['functionCall']
+                    tool_result = await self._execute_tool(fc, channel)
                     func_resp_parts.append({
                         "functionResponse": {
-                            "name": tc['name'],
+                            "name": fc['name'],
                             "response": {"content": tool_result},
                         }
                     })
-                    if tc['name'] == 'exit_conversation':
+                    if fc['name'] == 'exit_conversation':
                         exit_called = True
 
                 # 将工具结果加入历史
@@ -398,7 +409,6 @@ class AICustomerService(commands.Cog, name="AI客服"):
                     self.conversations.pop(channel_id, None)
                     return
 
-                # 有更多工具调用需要处理，继续循环
                 try:
                     await bot_message.edit(content="💭 处理中...")
                 except discord.HTTPException:
