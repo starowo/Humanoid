@@ -248,19 +248,34 @@ class AICustomerService(commands.Cog, name="AI客服"):
         text_signature: str | None = None
         last_edit_time = 0.0
         min_edit_interval = 1.0 / 3
+        max_retries = 3
 
-        async with self.session.post(
-            url,
-            json=request_body,
-            headers={"Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=300),
-        ) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise Exception(f"Gemini API 错误 ({response.status}): {error_text[:500]}")
+        for attempt in range(max_retries):
+            resp = await self.session.post(
+                url,
+                json=request_body,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=300),
+            )
+            if resp.status == 429:
+                resp.release()
+                retry_after = int(resp.headers.get('Retry-After', 10))
+                if attempt < max_retries - 1:
+                    try:
+                        await bot_message.edit(content=f"⏳ API 限流，{retry_after}秒后重试...")
+                    except discord.HTTPException:
+                        pass
+                    await asyncio.sleep(retry_after)
+                    continue
+            break
+
+        async with resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                raise Exception(f"Gemini API 错误 ({resp.status}): {error_text[:500]}")
 
             while True:
-                line_bytes = await response.content.readline()
+                line_bytes = await resp.content.readline()
                 if not line_bytes:
                     break
 
