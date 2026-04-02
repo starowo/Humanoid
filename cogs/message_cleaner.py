@@ -362,7 +362,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
     @app_commands.command(name="一键冲水", description="删除指定用户在指定范围内的所有消息")
     @app_commands.describe(
         用户="要删除消息的用户（服务器成员）",
-        用户ID="要删除消息的用户 ID（支持不在服务器的用户，与「用户」二选一）",
+        用户id="要删除消息的用户 ID（支持不在服务器的用户，与「用户」二选一）",
         频道="指定频道（留空则搜索整个服务器）",
         排序方式="搜索顺序，默认从新到旧",
         最近天数="只删除最近 N 天内的消息（留空则不限时间）"
@@ -375,7 +375,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
         self,
         interaction: discord.Interaction,
         用户: Optional[discord.Member] = None,
-        用户ID: Optional[str] = None,
+        用户id: Optional[str] = None,
         频道: Optional[discord.abc.GuildChannel] = None,
         排序方式: str = "desc",
         最近天数: Optional[int] = None
@@ -391,9 +391,9 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
             return
 
         # 至少需要提供「用户」或「用户ID」之一
-        if 用户 is None and 用户ID is None:
+        if 用户 is None and 用户id is None:
             await interaction.followup.send(
-                "❌ 请提供「用户」或「用户ID」参数！",
+                "❌ 请提供「用户」或「用户id」参数！",
             )
             return
 
@@ -403,13 +403,13 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
             target_display = 用户.mention
             target_name = 用户.name
         else:
-            用户ID = 用户ID.strip()
-            if not 用户ID.isdigit():
+            用户id = 用户id.strip()
+            if not 用户id.isdigit():
                 await interaction.followup.send(
                     "❌ 用户 ID 格式无效，请输入纯数字 ID！",
                 )
                 return
-            target_id = int(用户ID)
+            target_id = int(用户id)
             # 尝试从缓存获取用户信息，失败则只显示 ID
             try:
                 fetched = await self.bot.fetch_user(target_id)
@@ -417,7 +417,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                 target_name = str(fetched)
             except Exception:
                 target_display = f"`{target_id}`"
-                target_name = 用户ID
+                target_name = 用户id
 
         # 处理天数限制
         cutoff_snowflake = None
