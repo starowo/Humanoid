@@ -45,6 +45,39 @@ message_cleaner:
   # 最大消息数（防止搜索过多消息）
   max_messages: 100000
 
+# AI客服配置
+ai_customer_service:
+  gemini:
+    # Gemini API Key
+    api_key: "YOUR_GEMINI_API_KEY"
+    # 代理/自定义 API 地址（留空使用官方地址）
+    proxy_url: "https://generativelanguage.googleapis.com"
+    # 模型名称
+    model: "gemini-2.0-flash"
+    # 系统提示词文件路径（独立文本文件，方便编辑长提示词）
+    system_prompt_file: "config/ai_system_prompt.txt"
+    # 尾部附加提示词文件路径（追加在系统提示词末尾，用于强化规则，留空则不使用）
+    tail_prompt_file: ""
+
+  # 管理频道 ID（工具调用 send_to_admin 的目标频道）
+  admin_channel_id: 1234567890
+
+  # 对话历史最大轮数
+  max_history: 50
+
+  # 单个附件最大大小（字节），默认 10MB
+  max_attachment_size: 10485760
+
+  # 自动回复配置
+  auto_reply:
+    # 是否启用自动回复（检测新频道并自动开启AI客服）
+    enabled: false
+    # 监控的频道分类 ID 列表（在这些分类下新建频道时自动启用）
+    category_ids:
+      - 1234567890
+    # 新频道的问候消息
+    greeting: "你好！我是AI客服助手，有什么可以帮助你的吗？"
+
 # 热重载配置
 hot_reload:
   enabled: true

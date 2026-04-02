@@ -6,8 +6,10 @@ import discord
 from discord import app_commands
 from discord.abc import Snowflake
 from discord.ext import commands
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
+
+DISCORD_EPOCH = 1420070400000
 import asyncio
 import aiohttp
 from collections import deque
@@ -47,9 +49,16 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
         member_role_ids = [role.id for role in member.roles]
         return any(role_id in member_role_ids for role_id in self.allowed_role_ids)
     
+    @staticmethod
+    def datetime_to_snowflake(dt: datetime) -> int:
+        """将 datetime 转换为 Discord snowflake ID"""
+        timestamp_ms = int(dt.timestamp() * 1000)
+        return (timestamp_ms - DISCORD_EPOCH) << 22
+
     async def search_messages(self, guild_id: int, author_id: int, channel_id: Optional[int],
                              message_queue: deque, stop_event: asyncio.Event,
-                             progress_data: dict, sort_order: str = "desc"):
+                             progress_data: dict, sort_order: str = "desc",
+                             cutoff_snowflake: Optional[int] = None):
         """搜索消息的协程"""
         headers = {
             'Authorization': self.user_token,
@@ -57,9 +66,12 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
         }
 
         total_messages = -1
-        # desc 模式跟踪最小 ID（最旧），asc 模式跟踪最大 ID（最新）
         current_pivot_id = -1
         search_count = 0
+
+        # asc 模式且有时间截止：从截止时间点开始搜索
+        if sort_order == "asc" and cutoff_snowflake is not None:
+            current_pivot_id = cutoff_snowflake
 
         async with aiohttp.ClientSession() as session:
             while not stop_event.is_set():
@@ -83,6 +95,10 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                             url += f"&max_id={current_pivot_id}"
                         else:
                             url += f"&min_id={current_pivot_id}"
+
+                    # desc 模式且有时间截止：限制搜索的最旧边界
+                    if sort_order == "desc" and cutoff_snowflake is not None:
+                        url += f"&min_id={cutoff_snowflake}"
 
                     # 发送请求
                     async with session.get(url, headers=headers) as response:
@@ -348,7 +364,8 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
         用户="要删除消息的用户（服务器成员）",
         用户ID="要删除消息的用户 ID（支持不在服务器的用户，与「用户」二选一）",
         频道="指定频道（留空则搜索整个服务器）",
-        排序方式="搜索顺序，默认从新到旧"
+        排序方式="搜索顺序，默认从新到旧",
+        最近天数="只删除最近 N 天内的消息（留空则不限时间）"
     )
     @app_commands.choices(排序方式=[
         app_commands.Choice(name="从新到旧", value="desc"),
@@ -360,7 +377,8 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
         用户: Optional[discord.Member] = None,
         用户ID: Optional[str] = None,
         频道: Optional[discord.abc.GuildChannel] = None,
-        排序方式: str = "desc"
+        排序方式: str = "desc",
+        最近天数: Optional[int] = None
     ):
         """一键冲水命令"""
 
@@ -411,6 +429,20 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                 target_display = f"`{target_id}`"
                 target_name = 用户ID
 
+        # 处理天数限制
+        cutoff_snowflake = None
+        days_label = "不限"
+        if 最近天数 is not None:
+            if 最近天数 < 1:
+                await interaction.response.send_message(
+                    "❌ 天数必须为正整数！",
+                    ephemeral=True
+                )
+                return
+            cutoff_dt = datetime.utcnow() - timedelta(days=最近天数)
+            cutoff_snowflake = self.datetime_to_snowflake(cutoff_dt)
+            days_label = f"最近 {最近天数} 天"
+
         sort_label = "从旧到新 ⬆️" if 排序方式 == "asc" else "从新到旧 ⬇️"
 
         # 创建初始 Embed
@@ -426,6 +458,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
             inline=True
         )
         embed.add_field(name="排序方式", value=sort_label, inline=True)
+        embed.add_field(name="时间范围", value=days_label, inline=True)
 
         await interaction.response.send_message(embed=embed)
         message = await interaction.original_response()
@@ -461,7 +494,8 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
                 message_queue,
                 stop_event,
                 progress_data,
-                排序方式
+                排序方式,
+                cutoff_snowflake
             )
         )
 
@@ -509,6 +543,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
             )
             final_embed.add_field(name="目标用户", value=target_display, inline=True)
             final_embed.add_field(name="排序方式", value=sort_label, inline=True)
+            final_embed.add_field(name="时间范围", value=days_label, inline=True)
             final_embed.add_field(name="已搜索", value=f"`{progress_data['searched']}` 条", inline=True)
             final_embed.add_field(name="已删除", value=f"`{progress_data['deleted']}` 条", inline=True)
             final_embed.add_field(name="无法删除", value=f"`{progress_data['forbidden']}` 条", inline=True)

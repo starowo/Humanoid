@@ -33,6 +33,7 @@ class HumanoidBot(commands.Bot):
             'cogs.channel_manager',
             'cogs.message_cleaner',
             'cogs.thread_soft_lock',
+            'cogs.ai_customer_service',
         ]
         
     async def setup_hook(self):
