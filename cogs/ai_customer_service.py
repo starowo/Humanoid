@@ -724,7 +724,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
             msgs = [message]
             while msgs:
                 await self._run_generation(channel, channel_id, msgs)
-                msgs = self._drain_pending(channel_id)
+                msgs = await self._drain_pending(channel_id)
 
         except Exception as e:
             print(
