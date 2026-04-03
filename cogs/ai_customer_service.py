@@ -112,6 +112,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.debug_channels: set[int] = set()
         self.generation_tasks: dict[int, asyncio.Task] = {}
         self.channel_complainants: dict[int, int] = {}  # channel_id -> 原始投诉人 user_id
+        self.channel_threads: dict[int, discord.Thread] = {}  # channel_id -> 管理频道中的 thread
         self.session: Optional[aiohttp.ClientSession] = None
         self.load_config()
 
@@ -464,14 +465,16 @@ class AICustomerService(commands.Cog, name="AI客服"):
             msg_text = args.get('message', '')
             if not self.admin_channel_id:
                 return {"error": "未配置管理频道"}
-            admin_ch = self.bot.get_channel(self.admin_channel_id)
-            if not admin_ch:
-                try:
-                    admin_ch = await self.bot.fetch_channel(self.admin_channel_id)
-                except Exception:
-                    return {"error": "无法访问管理频道"}
+            target = self.channel_threads.get(channel.id)
+            if not target:
+                target = self.bot.get_channel(self.admin_channel_id)
+                if not target:
+                    try:
+                        target = await self.bot.fetch_channel(self.admin_channel_id)
+                    except Exception:
+                        return {"error": "无法访问管理频道"}
             view = AdminInjectView(self, channel.id)
-            await admin_ch.send(f"**来自 <#{channel.id}>：**\n{msg_text}", view=view)
+            await target.send(f"**来自 <#{channel.id}>：**\n{msg_text}", view=view)
             return {"result": "消息已发送到管理频道"}
 
         if name == 'exit_conversation':
@@ -596,6 +599,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
                     self.active_channels.discard(channel_id)
                     self.conversations.pop(channel_id, None)
                     self.channel_complainants.pop(channel_id, None)
+                    self.channel_threads.pop(channel_id, None)
                     return
 
                 # debug 模式：显示工具调用详情
@@ -647,9 +651,11 @@ class AICustomerService(commands.Cog, name="AI客服"):
         rollback_index = len(self.conversations[channel_id])
         self.conversations[channel_id].append({"role": "user", "parts": combined_parts})
 
-        if len(self.conversations[channel_id]) > self.max_history:
-            self.conversations[channel_id] = self.conversations[channel_id][-self.max_history:]
-            rollback_index = max(0, rollback_index - (len(combined_parts)))
+        conv = self.conversations[channel_id]
+        if len(conv) > self.max_history:
+            overflow = len(conv) - self.max_history
+            self.conversations[channel_id] = conv[-self.max_history:]
+            rollback_index = max(0, rollback_index - overflow)
 
         bot_message = await channel.send("💭 思考中...")
 
@@ -661,13 +667,15 @@ class AICustomerService(commands.Cog, name="AI客服"):
         try:
             await gen_task
         except asyncio.CancelledError:
+            # 回滚优先（同步操作，保证执行）：移除本轮 user turn 及所有不完整的 model/function 响应
+            convos = self.conversations.get(channel_id, [])
+            if len(convos) > rollback_index:
+                del convos[rollback_index:]
+            # 再尝试删除未完成的 bot 消息
             try:
                 await bot_message.delete()
-            except discord.HTTPException:
+            except Exception:
                 pass
-            # 回滚：移除本轮 user turn 及所有不完整的 model/function 响应
-            convos = self.conversations.get(channel_id, [])
-            del convos[rollback_index:]
 
     async def _record_only(self, channel_id: int, message: discord.Message):
         """仅将消息记入对话历史，不触发 AI 回复"""
@@ -685,26 +693,30 @@ class AICustomerService(commands.Cog, name="AI客服"):
             return True
         return self.channel_complainants[channel_id] == user_id
 
+    def _should_respond(self, channel_id: int, message: discord.Message) -> bool:
+        """判断是否应对该消息触发 AI 回复（仅原始投诉人）"""
+        is_admin = isinstance(message.author, discord.Member) and self._is_admin(message.author)
+        if is_admin:
+            return False
+        return self._is_complainant(channel_id, message.author.id)
+
     async def _handle_message(self, message: discord.Message):
         channel = message.channel
         channel_id = channel.id
-        is_admin = isinstance(message.author, discord.Member) and self._is_admin(message.author)
+        respond = self._should_respond(channel_id, message)
 
-        # 非原始投诉人且非管理组：仅记录不回复
-        if not is_admin and not self._is_complainant(channel_id, message.author.id):
-            await self._record_only(channel_id, message)
-            return
-
-        # 管理组成员的可见消息也仅记录不回复（管理组通过 /ai管理 或按钮发隐藏指令）
-        if is_admin:
-            await self._record_only(channel_id, message)
-            return
-
+        # 正在处理中：所有消息统一入队，避免并发修改对话历史
         if channel_id in self.processing_channels:
             self.pending_messages.setdefault(channel_id, []).append(message)
-            task = self.generation_tasks.get(channel_id)
-            if task and not task.done():
-                task.cancel()
+            if respond:
+                task = self.generation_tasks.get(channel_id)
+                if task and not task.done():
+                    task.cancel()
+            return
+
+        # 不需要 AI 回复的消息（管理组 / 非投诉人）：仅记录
+        if not respond:
+            await self._record_only(channel_id, message)
             return
 
         self.processing_channels.add(channel_id)
@@ -712,11 +724,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
             msgs = [message]
             while msgs:
                 await self._run_generation(channel, channel_id, msgs)
-                msgs = (
-                    self.pending_messages.pop(channel_id)
-                    if channel_id in self.active_channels and self.pending_messages.get(channel_id)
-                    else None
-                )
+                msgs = self._drain_pending(channel_id)
 
         except Exception as e:
             print(
@@ -732,6 +740,21 @@ class AICustomerService(commands.Cog, name="AI客服"):
             self.pending_messages.pop(channel_id, None)
             self.generation_tasks.pop(channel_id, None)
 
+    async def _drain_pending(self, channel_id: int) -> list[discord.Message] | None:
+        """从待处理队列中取出消息，非投诉人消息仅记录，返回需要生成回复的投诉人消息"""
+        if channel_id not in self.active_channels:
+            return None
+        pending = self.pending_messages.pop(channel_id, [])
+        if not pending:
+            return None
+        complainant_msgs = []
+        for msg in pending:
+            if self._should_respond(channel_id, msg):
+                complainant_msgs.append(msg)
+            else:
+                await self._record_only(channel_id, msg)
+        return complainant_msgs or None
+
     # ── 事件监听 ──────────────────────────────────────────────
 
     @commands.Cog.listener()
@@ -746,6 +769,9 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
         self.active_channels.add(channel.id)
         self.conversations[channel.id] = []
+
+        # 在管理频道创建 thread
+        await self._create_admin_thread(channel)
 
         await asyncio.sleep(1)
 
@@ -765,11 +791,47 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 f"[AI客服] 发送问候消息失败: {e}"
             )
 
+    async def _create_admin_thread(self, channel: discord.TextChannel):
+        """在管理频道为新投诉频道创建对应的 thread"""
+        if not self.admin_channel_id:
+            return
+        try:
+            admin_ch = self.bot.get_channel(self.admin_channel_id)
+            if not admin_ch:
+                admin_ch = await self.bot.fetch_channel(self.admin_channel_id)
+
+            thread = await admin_ch.create_thread(
+                name=f"新投诉 - {channel.id}",
+                type=discord.ChannelType.public_thread,
+            )
+            self.channel_threads[channel.id] = thread
+
+            await asyncio.sleep(2)
+            try:
+                await thread.edit(name=channel.name)
+            except discord.HTTPException:
+                pass
+
+            role_mentions = " ".join(f"<@&{rid}>" for rid in self.allowed_role_ids)
+            if role_mentions:
+                await thread.send(
+                    f"📋 新投诉频道 <#{channel.id}> 已创建\n{role_mentions}"
+                )
+            else:
+                await thread.send(f"📋 新投诉频道 <#{channel.id}> 已创建")
+
+        except Exception as e:
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"[AI客服] 创建管理 thread 失败: {e}"
+            )
+
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel):
         """频道删除时清理资源"""
         self.active_channels.discard(channel.id)
         self.channel_complainants.pop(channel.id, None)
+        self.channel_threads.pop(channel.id, None)
         self.conversations.pop(channel.id, None)
 
     @commands.Cog.listener()
@@ -818,6 +880,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
             self.active_channels.discard(channel_id)
             self.conversations.pop(channel_id, None)
             self.channel_complainants.pop(channel_id, None)
+            self.channel_threads.pop(channel_id, None)
             await interaction.response.send_message("✅ AI客服已在此频道关闭", ephemeral=True)
             print(
                 f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
