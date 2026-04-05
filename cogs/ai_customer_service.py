@@ -16,6 +16,10 @@ import time
 import re
 
 
+# send_to_admin 工具发往管理区/子区的正文前缀，用于恢复持久化按钮
+_ADMIN_TOOL_MESSAGE_HEADER = re.compile(r"^\*\*来自 <#(\d+)>：\*\*", re.MULTILINE)
+
+
 class AdminInjectModal(discord.ui.Modal, title="向AI发送隐藏指令"):
     """管理员快速注入指令的弹出表单"""
     指令 = discord.ui.TextInput(
@@ -114,6 +118,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.channel_complainants: dict[int, int] = {}  # channel_id -> 原始投诉人 user_id
         self.channel_threads: dict[int, discord.Thread] = {}  # channel_id -> 管理频道中的 thread
         self.session: Optional[aiohttp.ClientSession] = None
+        self._restored_from_discord_once: bool = False
         self.load_config()
 
     async def cog_load(self):
@@ -170,6 +175,222 @@ class AICustomerService(commands.Cog, name="AI客服"):
     async def on_config_reload(self):
         """配置重载回调"""
         self.load_config()
+
+    def _is_transient_bot_chunk(self, message: discord.Message) -> bool:
+        """重建历史时忽略本 Bot 的中间状态占位消息"""
+        if message.author.id != self.bot.user.id:
+            return False
+        text = (message.content or "").strip()
+        if not text:
+            return True
+        if text in ("💭 思考中...", "💭 处理中..."):
+            return True
+        if text.startswith("⏳"):
+            return True
+        if text.startswith("⚠️ AI未生成回复"):
+            return True
+        return False
+
+    async def _find_admin_thread_by_channel_name(
+        self,
+        admin_parent: discord.abc.GuildChannel,
+        channel_name: str,
+    ) -> Optional[discord.Thread]:
+        """在管理频道（文字帖/论坛）下按子区名称匹配，先活跃再归档；搜不到返回 None"""
+        if not isinstance(admin_parent, (discord.TextChannel, discord.ForumChannel)):
+            return None
+        try:
+            for t in admin_parent.threads:
+                if t.name == channel_name:
+                    return t
+            async for t in admin_parent.archived_threads(limit=100):
+                if t.name == channel_name:
+                    return t
+        except Exception as e:
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"[AI客服] 搜索管理子区失败 ({channel_name}): {e}",
+            )
+        return None
+
+    def _message_has_send_inject_button(self, message: discord.Message) -> bool:
+        """是否为附带「发送指令」按钮的管理同步消息（discord.components 结构）"""
+        if not message.components:
+            return False
+        for row in message.components:
+            for comp in row.children:
+                if comp.type != discord.ComponentType.button:
+                    continue
+                if getattr(comp, "label", None) == "发送指令":
+                    return True
+        return False
+
+    async def _reregister_admin_inject_views_in_thread(
+        self,
+        thread: discord.Thread,
+        expected_source_channel_id: int,
+        history_limit: int = 200,
+    ) -> int:
+        """
+        在已匹配的管理子区内扫描助手历史消息，对带「发送指令」的视图重新 add_view，使重启后按钮可点。
+        只处理正文中来源频道 ID 与 expected_source_channel_id 一致的消息。
+        """
+        n = 0
+        try:
+            async for msg in thread.history(limit=history_limit):
+                if msg.author.id != self.bot.user.id:
+                    continue
+                if not self._message_has_send_inject_button(msg):
+                    continue
+                m = _ADMIN_TOOL_MESSAGE_HEADER.search(msg.content or "")
+                if not m:
+                    continue
+                src_id = int(m.group(1))
+                if src_id != expected_source_channel_id:
+                    continue
+                view = AdminInjectView(self, src_id)
+                self.bot.add_view(view, message_id=msg.id, channel_id=thread.id)
+                n += 1
+        except Exception as e:
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"[AI客服] 重新绑定管理子区 #{thread.name} 按钮失败: {e}",
+            )
+        return n
+
+    async def _rebuild_conversation_from_history(
+        self,
+        channel: discord.TextChannel,
+    ) -> tuple[list, Optional[int]]:
+        """
+        从频道消息历史重建 Gemini contents（由旧到新）。
+        返回 (对话列表, 投诉人 user_id 若可从历史中确定否则 None)。
+        """
+        complainant_id: Optional[int] = None
+        conv: list = []
+        bot_uid = self.bot.user.id
+        # 多取一些消息：一轮对话可能含多条 Bot 分包
+        msg_limit = max(150, self.max_history * 4)
+        pending_bot_chunks: list[str] = []
+
+        def flush_bot():
+            nonlocal pending_bot_chunks
+            if not pending_bot_chunks:
+                return
+            merged = "\n".join(pending_bot_chunks).strip()
+            pending_bot_chunks = []
+            if merged:
+                conv.append({"role": "model", "parts": [{"text": merged}]})
+
+        async for msg in channel.history(limit=msg_limit, oldest_first=True):
+            if msg.type not in (discord.MessageType.default, discord.MessageType.reply):
+                continue
+            if msg.author.bot:
+                if msg.author.id == bot_uid:
+                    if self._is_transient_bot_chunk(msg):
+                        continue
+                    text = (msg.content or "").strip()
+                    if text:
+                        pending_bot_chunks.append(msg.content or "")
+                else:
+                    flush_bot()
+                    conv.append(await self._build_user_message(msg))
+                continue
+
+            flush_bot()
+            if complainant_id is None:
+                m = msg.author
+                if isinstance(m, discord.Member) and self._is_admin(m):
+                    pass
+                else:
+                    complainant_id = msg.author.id
+            conv.append(await self._build_user_message(msg))
+
+        flush_bot()
+
+        if len(conv) > self.max_history:
+            conv = conv[-self.max_history :]
+
+        return conv, complainant_id
+
+    async def _restore_auto_reply_state(self):
+        """启动时从 Discord 拉回分类下各频道消息与管理子区，修复内存中的对话与映射"""
+        if not self.auto_reply_enabled or not self.auto_reply_category_ids:
+            return
+        if not self.api_key:
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                "[AI客服] 跳过对话恢复：未配置 API Key",
+            )
+            return
+        if not self.session or self.session.closed:
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                "[AI客服] 跳过对话恢复：HTTP 会话未就绪",
+            )
+            return
+
+        admin_parent: Optional[discord.abc.GuildChannel] = None
+        if self.admin_channel_id:
+            admin_parent = self.bot.get_channel(self.admin_channel_id)
+            if not admin_parent:
+                try:
+                    admin_parent = await self.bot.fetch_channel(self.admin_channel_id)
+                except Exception:
+                    admin_parent = None
+
+        print(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+            "[AI客服] 开始从 Discord 恢复投诉频道状态…",
+        )
+
+        restored = 0
+        for guild in self.bot.guilds:
+            for cat_id in self.auto_reply_category_ids:
+                category = guild.get_channel(cat_id)
+                if category is None or not isinstance(category, discord.CategoryChannel):
+                    continue
+                for ch in category.text_channels:
+                    try:
+                        conv, complainant_id = await self._rebuild_conversation_from_history(ch)
+                        self.conversations[ch.id] = conv
+                        self.active_channels.add(ch.id)
+                        if complainant_id is not None:
+                            self.channel_complainants[ch.id] = complainant_id
+
+                        mapped: Optional[discord.Thread] = None
+                        rebound = 0
+                        if admin_parent:
+                            mapped = await self._find_admin_thread_by_channel_name(
+                                admin_parent, ch.name
+                            )
+                            if mapped:
+                                self.channel_threads[ch.id] = mapped
+                                rebound = await self._reregister_admin_inject_views_in_thread(
+                                    mapped, ch.id
+                                )
+
+                        restored += 1
+                        if mapped and rebound:
+                            tip = f"+管理子区 #{mapped.name}，已恢复 {rebound} 条「发送指令」按钮"
+                        elif mapped:
+                            tip = f"+管理子区 #{mapped.name}"
+                        else:
+                            tip = "（未匹配管理子区）"
+                        print(
+                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                            f"[AI客服] 已恢复 #{ch.name}（{len(conv)} 轮对话）{tip}",
+                        )
+                    except Exception as e:
+                        print(
+                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                            f"[AI客服] 恢复频道 #{getattr(ch, 'name', ch.id)} 失败: {e}",
+                        )
+
+        print(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"[AI客服] 投诉频道状态恢复结束，共处理 {restored} 个文字频道",
+        )
 
     def _is_admin(self, member: discord.Member) -> bool:
         """判断成员是否属于管理组"""
@@ -756,6 +977,19 @@ class AICustomerService(commands.Cog, name="AI客服"):
         return complainant_msgs or None
 
     # ── 事件监听 ──────────────────────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """启动（或重连后首次 ready）时从 Discord 恢复分类内频道的对话与管理子区映射"""
+        if self._restored_from_discord_once:
+            return
+        self._restored_from_discord_once = True
+
+        async def _delayed_restore():
+            await asyncio.sleep(2)
+            await self._restore_auto_reply_state()
+
+        asyncio.create_task(_delayed_restore())
 
     @commands.Cog.listener()
     async def on_guild_channel_create(self, channel):
