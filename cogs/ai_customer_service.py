@@ -249,7 +249,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 if src_id != expected_source_channel_id:
                     continue
                 view = AdminInjectView(self, src_id)
-                self.bot.add_view(view, message_id=msg.id, channel_id=thread.id)
+                self.bot.add_view(view, message_id=msg.id)
                 n += 1
         except Exception as e:
             print(
