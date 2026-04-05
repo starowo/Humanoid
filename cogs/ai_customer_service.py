@@ -20,6 +20,11 @@ import re
 _ADMIN_TOOL_MESSAGE_HEADER = re.compile(r"^\*\*来自 <#(\d+)>：\*\*", re.MULTILINE)
 
 
+def _admin_inject_button_custom_id(source_channel_id: int, admin_message_id: int) -> str:
+    """持久化按钮 custom_id（单条管理消息唯一，便于重启后 edit + add_view）"""
+    return f"humanoid_ai_inj_{source_channel_id}_{admin_message_id}"
+
+
 class AdminInjectModal(discord.ui.Modal, title="向AI发送隐藏指令"):
     """管理员快速注入指令的弹出表单"""
     指令 = discord.ui.TextInput(
@@ -87,14 +92,23 @@ class AdminInjectModal(discord.ui.Modal, title="向AI发送隐藏指令"):
 
 
 class AdminInjectView(discord.ui.View):
-    """附在管理频道消息上的快速指令按钮"""
-    def __init__(self, cog: "AICustomerService", source_channel_id: int):
+    """附在管理频道消息上的快速指令按钮（必须带 custom_id 且 timeout=None 才能持久化 / add_view）"""
+
+    def __init__(self, cog: "AICustomerService", source_channel_id: int, admin_message_id: int):
         super().__init__(timeout=None)
         self.cog = cog
         self.source_channel_id = source_channel_id
+        self.admin_message_id = admin_message_id
+        btn = discord.ui.Button(
+            label="发送指令",
+            style=discord.ButtonStyle.primary,
+            emoji="📝",
+            custom_id=_admin_inject_button_custom_id(source_channel_id, admin_message_id),
+        )
+        btn.callback = self._inject_button_callback
+        self.add_item(btn)
 
-    @discord.ui.button(label="发送指令", style=discord.ButtonStyle.primary, emoji="📝")
-    async def inject_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _inject_button_callback(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member) or not self.cog._is_admin(interaction.user):
             await interaction.response.send_message("❌ 你没有权限", ephemeral=True)
             return
@@ -232,30 +246,31 @@ class AICustomerService(commands.Cog, name="AI客服"):
         history_limit: int = 200,
     ) -> int:
         """
-        在已匹配的管理子区内扫描助手历史消息，对带「发送指令」的视图重新 add_view，使重启后按钮可点。
+        在已匹配的管理子区内扫描助手历史消息：edit 附上带 custom_id 的新 View，再 add_view。
         只处理正文中来源频道 ID 与 expected_source_channel_id 一致的消息。
         """
         n = 0
-        try:
-            async for msg in thread.history(limit=history_limit):
-                if msg.author.id != self.bot.user.id:
-                    continue
-                if not self._message_has_send_inject_button(msg):
-                    continue
-                m = _ADMIN_TOOL_MESSAGE_HEADER.search(msg.content or "")
-                if not m:
-                    continue
-                src_id = int(m.group(1))
-                if src_id != expected_source_channel_id:
-                    continue
-                view = AdminInjectView(self, src_id)
+        async for msg in thread.history(limit=history_limit):
+            if msg.author.id != self.bot.user.id:
+                continue
+            if not self._message_has_send_inject_button(msg):
+                continue
+            m = _ADMIN_TOOL_MESSAGE_HEADER.search(msg.content or "")
+            if not m:
+                continue
+            src_id = int(m.group(1))
+            if src_id != expected_source_channel_id:
+                continue
+            try:
+                view = AdminInjectView(self, src_id, msg.id)
+                await msg.edit(content=msg.content, view=view)
                 self.bot.add_view(view, message_id=msg.id)
                 n += 1
-        except Exception as e:
-            print(
-                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-                f"[AI客服] 重新绑定管理子区 #{thread.name} 按钮失败: {e}",
-            )
+            except Exception as e:
+                print(
+                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"[AI客服] 重新绑定单条管理消息 {msg.id} 失败: {e}",
+                )
         return n
 
     async def _rebuild_conversation_from_history(
@@ -694,8 +709,11 @@ class AICustomerService(commands.Cog, name="AI客服"):
                         target = await self.bot.fetch_channel(self.admin_channel_id)
                     except Exception:
                         return {"error": "无法访问管理频道"}
-            view = AdminInjectView(self, channel.id)
-            await target.send(f"**来自 <#{channel.id}>：**\n{msg_text}", view=view)
+            content = f"**来自 <#{channel.id}>：**\n{msg_text}"
+            sent = await target.send(content)
+            view = AdminInjectView(self, channel.id, sent.id)
+            await sent.edit(view=view)
+            self.bot.add_view(view, message_id=sent.id)
             return {"result": "消息已发送到管理频道"}
 
         if name == 'exit_conversation':
