@@ -1,6 +1,7 @@
 """
 线程软锁定模块
-将线程软锁定后，所有不在白名单身份组中的用户发言会被立即删除
+将线程软锁定后，所有不在白名单身份组中的用户发言会被立即删除；
+管理组与本帖楼主可执行软锁定相关命令，楼主发言不会被删除。
 """
 import discord
 from discord import app_commands
@@ -17,9 +18,28 @@ class ThreadSoftLock(commands.Cog, name="线程软锁定"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.config_loader = bot.config_loader
+        self.allowed_role_ids = self.config_loader.get('allowed_role_ids', [])
         self.data_file = "data/thread_soft_lock.json"
         self.locked_threads = {}  # {thread_id: {"whitelist_roles": [role_id, ...], "locked_by": user_id, "locked_at": timestamp}}
         self.load_data()
+
+    async def on_config_reload(self):
+        self.allowed_role_ids = self.config_loader.get('allowed_role_ids', [])
+
+    def _is_staff(self, member: discord.Member) -> bool:
+        """管理组：管理员或配置中的 allowed_role_ids"""
+        if member.guild_permissions.administrator:
+            return True
+        if not self.allowed_role_ids:
+            return False
+        member_role_ids = [role.id for role in member.roles]
+        return any(rid in member_role_ids for rid in self.allowed_role_ids)
+
+    def _is_thread_owner(self, thread: discord.Thread, user_id: int) -> bool:
+        return thread.owner_id is not None and thread.owner_id == user_id
+
+    def _can_use_soft_lock_commands(self, member: discord.Member, thread: discord.Thread) -> bool:
+        return self._is_staff(member) or self._is_thread_owner(thread, member.id)
     
     def load_data(self):
         """从文件加载持久化数据"""
@@ -43,13 +63,18 @@ class ThreadSoftLock(commands.Cog, name="线程软锁定"):
         except Exception as e:
             print(f"[ThreadSoftLock] 保存数据失败: {e}")
     
-    def is_user_whitelisted(self, member: discord.Member, thread_id: int) -> bool:
-        """检查用户是否在白名单中"""
+    def is_user_whitelisted(self, member: discord.Member, thread: discord.Thread) -> bool:
+        """检查用户是否在白名单中（含管理员与本帖楼主豁免）"""
+        thread_id = thread.id
         if thread_id not in self.locked_threads:
             return True
         
         # 管理员始终在白名单中
         if member.guild_permissions.administrator:
+            return True
+
+        # 论坛帖 / 线程创建者（楼主）豁免删除
+        if self._is_thread_owner(thread, member.id):
             return True
         
         whitelist_roles = self.locked_threads[thread_id].get("whitelist_roles", [])
@@ -79,7 +104,7 @@ class ThreadSoftLock(commands.Cog, name="线程软锁定"):
             return
         
         # 检查用户是否在白名单中
-        if not self.is_user_whitelisted(message.author, thread_id):
+        if not self.is_user_whitelisted(message.author, message.channel):
             try:
                 await message.delete()
                 print(f"[ThreadSoftLock] 已删除 {message.author.name} 在软锁定线程 {message.channel.name} 中的消息")
@@ -92,22 +117,43 @@ class ThreadSoftLock(commands.Cog, name="线程软锁定"):
     
     soft_lock_group = app_commands.Group(
         name="软锁定",
-        description="线程软锁定相关命令",
-        default_permissions=discord.Permissions(administrator=True)
+        description="线程软锁定相关命令（管理组或本帖楼主）",
+        default_permissions=None,
     )
+
+    async def _ensure_soft_lock_command_user(
+        self, interaction: discord.Interaction
+    ) -> Optional[discord.Thread]:
+        """在线程内且为管理组或楼主时返回线程，否则回复错误并返回 None。"""
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
+                "❌ 此命令只能在线程中使用！",
+                ephemeral=True,
+            )
+            return None
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "❌ 此命令仅在服务器内有效。",
+                ephemeral=True,
+            )
+            return None
+        thread = interaction.channel
+        if not self._can_use_soft_lock_commands(interaction.user, thread):
+            await interaction.response.send_message(
+                "❌ 仅管理组或本帖楼主可使用此命令。",
+                ephemeral=True,
+            )
+            return None
+        return thread
     
     @soft_lock_group.command(name="锁定", description="软锁定当前线程")
     async def lock_thread(self, interaction: discord.Interaction):
         """软锁定当前线程"""
-        # 检查是否在线程中
-        if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message(
-                "❌ 此命令只能在线程中使用！",
-                ephemeral=True
-            )
+        thread = await self._ensure_soft_lock_command_user(interaction)
+        if thread is None:
             return
-        
-        thread_id = interaction.channel.id
+
+        thread_id = thread.id
         
         # 检查是否已经锁定
         if thread_id in self.locked_threads:
@@ -127,7 +173,7 @@ class ThreadSoftLock(commands.Cog, name="线程软锁定"):
         
         embed = discord.Embed(
             title="🔒 线程已软锁定",
-            description="此线程已被软锁定，只有管理员和白名单身份组成员可以发言。",
+            description="此线程已被软锁定，仅管理员、白名单身份组成员与本帖楼主可发言。",
             color=discord.Color.orange(),
             timestamp=datetime.now()
         )
@@ -142,15 +188,11 @@ class ThreadSoftLock(commands.Cog, name="线程软锁定"):
     @soft_lock_group.command(name="解锁", description="解除当前线程的软锁定")
     async def unlock_thread(self, interaction: discord.Interaction):
         """解除软锁定"""
-        # 检查是否在线程中
-        if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message(
-                "❌ 此命令只能在线程中使用！",
-                ephemeral=True
-            )
+        thread = await self._ensure_soft_lock_command_user(interaction)
+        if thread is None:
             return
-        
-        thread_id = interaction.channel.id
+
+        thread_id = thread.id
         
         # 检查是否已锁定
         if thread_id not in self.locked_threads:
@@ -179,20 +221,16 @@ class ThreadSoftLock(commands.Cog, name="线程软锁定"):
     @soft_lock_group.command(name="添加白名单", description="添加白名单身份组")
     @app_commands.describe(身份组="要添加到白名单的身份组")
     async def add_whitelist_role(
-        self, 
+        self,
         interaction: discord.Interaction,
         身份组: discord.Role
     ):
         """添加白名单身份组"""
-        # 检查是否在线程中
-        if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message(
-                "❌ 此命令只能在线程中使用！",
-                ephemeral=True
-            )
+        thread = await self._ensure_soft_lock_command_user(interaction)
+        if thread is None:
             return
-        
-        thread_id = interaction.channel.id
+
+        thread_id = thread.id
         
         # 检查是否已锁定
         if thread_id not in self.locked_threads:
@@ -236,20 +274,16 @@ class ThreadSoftLock(commands.Cog, name="线程软锁定"):
     @soft_lock_group.command(name="删除白名单", description="删除白名单身份组")
     @app_commands.describe(身份组="要从白名单移除的身份组")
     async def remove_whitelist_role(
-        self, 
+        self,
         interaction: discord.Interaction,
         身份组: discord.Role
     ):
         """删除白名单身份组"""
-        # 检查是否在线程中
-        if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message(
-                "❌ 此命令只能在线程中使用！",
-                ephemeral=True
-            )
+        thread = await self._ensure_soft_lock_command_user(interaction)
+        if thread is None:
             return
-        
-        thread_id = interaction.channel.id
+
+        thread_id = thread.id
         
         # 检查是否已锁定
         if thread_id not in self.locked_threads:
@@ -293,15 +327,11 @@ class ThreadSoftLock(commands.Cog, name="线程软锁定"):
     @soft_lock_group.command(name="状态", description="查看当前线程的软锁定状态")
     async def lock_status(self, interaction: discord.Interaction):
         """查看软锁定状态"""
-        # 检查是否在线程中
-        if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message(
-                "❌ 此命令只能在线程中使用！",
-                ephemeral=True
-            )
+        thread = await self._ensure_soft_lock_command_user(interaction)
+        if thread is None:
             return
-        
-        thread_id = interaction.channel.id
+
+        thread_id = thread.id
         
         # 检查是否已锁定
         if thread_id not in self.locked_threads:
@@ -335,8 +365,8 @@ class ThreadSoftLock(commands.Cog, name="线程软锁定"):
         embed.add_field(name="锁定者", value=locked_by_text, inline=True)
         embed.add_field(name="锁定时间", value=lock_info.get("locked_at", "未知"), inline=True)
         embed.add_field(
-            name="白名单身份组", 
-            value="\n".join(whitelist_mentions) if whitelist_mentions else "无（仅管理员可发言）", 
+            name="白名单身份组",
+            value="\n".join(whitelist_mentions) if whitelist_mentions else "无（管理员与本帖楼主可发言）",
             inline=False
         )
         
