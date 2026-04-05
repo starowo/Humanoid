@@ -399,6 +399,7 @@ class MessageCleaner(commands.Cog, name="一键冲水"):
             'forbidden': 0,
             'not_found': 0,
             'delete_errors': 0,
+            'skipped_pinned': 0,
             'skipped_threads': 0,
             'search_finished': False,
             'rate_limited': False,
