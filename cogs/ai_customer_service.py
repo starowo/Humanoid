@@ -1080,11 +1080,29 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel):
-        """频道删除时清理资源"""
+        """频道删除时清理资源；若映射过管理子区则归档关闭"""
+        thread = self.channel_threads.pop(channel.id, None)
         self.active_channels.discard(channel.id)
         self.channel_complainants.pop(channel.id, None)
-        self.channel_threads.pop(channel.id, None)
         self.conversations.pop(channel.id, None)
+
+        if thread is not None:
+            try:
+                await thread.edit(archived=True)
+                print(
+                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"[AI客服] 投诉频道已删除，已归档管理子区 #{thread.name} ({thread.id})",
+                )
+            except discord.Forbidden:
+                print(
+                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"[AI客服] 无权归档管理子区 {thread.id}",
+                )
+            except discord.HTTPException as e:
+                print(
+                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"[AI客服] 归档管理子区失败 {thread.id}: {e}",
+                )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
