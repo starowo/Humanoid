@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Any, Optional, Union
 from pathlib import Path
 import asyncio
 import aiohttp
@@ -144,15 +144,18 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.channel_complainants: dict[int, int] = {}  # channel_id -> 原始投诉人 user_id
         self.channel_threads: dict[int, discord.Thread] = {}  # channel_id -> 管理频道中的 thread
         self.session: Optional[aiohttp.ClientSession] = None
+        self._openai_client: Any = None  # openai.AsyncOpenAI，惰性初始化
         self._restored_from_discord_once: bool = False
         self.load_config()
 
     async def cog_load(self):
         self.session = aiohttp.ClientSession()
+        await self._ensure_openai_client()
 
     async def cog_unload(self):
         if self.session and not self.session.closed:
             await self.session.close()
+        await self._close_openai_client()
 
     # ── 配置管理 ──────────────────────────────────────────────
 
@@ -174,6 +177,12 @@ class AICustomerService(commands.Cog, name="AI客服"):
     def load_config(self):
         """加载配置"""
         cfg = self.config_loader
+        self.llm_provider = str(
+            cfg.get('ai_customer_service.provider', 'gemini')
+        ).strip().lower()
+        if self.llm_provider not in ('gemini', 'claude_openai'):
+            self.llm_provider = 'gemini'
+
         self.api_key = cfg.get('ai_customer_service.gemini.api_key', '')
         self.proxy_url = cfg.get(
             'ai_customer_service.gemini.proxy_url',
@@ -197,6 +206,27 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.max_history = cfg.get('ai_customer_service.max_history', 50)
         self.max_attachment_size = cfg.get('ai_customer_service.max_attachment_size', 10 * 1024 * 1024)
         self.allowed_role_ids = cfg.get('allowed_role_ids', [])
+
+        self.claude_openai_api_key = cfg.get(
+            'ai_customer_service.claude_openai.api_key', ''
+        )
+        _bu = cfg.get(
+            'ai_customer_service.claude_openai.base_url',
+            'https://api.anthropic.com/v1/',
+        )
+        self.claude_openai_base_url = _bu.rstrip('/') + '/'
+        self.claude_openai_model = cfg.get(
+            'ai_customer_service.claude_openai.model',
+            'claude-sonnet-4-20250514',
+        )
+        self.claude_openai_max_tokens = int(
+            cfg.get('ai_customer_service.claude_openai.max_tokens', 8192)
+        )
+        raw_thinking = cfg.get('ai_customer_service.claude_openai.thinking')
+        self.claude_openai_thinking: Optional[dict[str, Any]] = (
+            dict(raw_thinking) if isinstance(raw_thinking, dict) else None
+        )
+
         self.fetch_punishments_channel_id = int(
             cfg.get(
                 'ai_customer_service.send_to_admin_presets.fetch_punishments_channel_id',
@@ -221,6 +251,65 @@ class AICustomerService(commands.Cog, name="AI客服"):
     async def on_config_reload(self):
         """配置重载回调"""
         self.load_config()
+        await self._ensure_openai_client()
+
+    def _llm_configured(self) -> bool:
+        if self.llm_provider == 'claude_openai':
+            return bool(self.claude_openai_api_key)
+        return bool(self.api_key)
+
+    async def _close_openai_client(self):
+        if self._openai_client is not None:
+            try:
+                await self._openai_client.close()
+            except Exception:
+                pass
+            self._openai_client = None
+
+    async def _ensure_openai_client(self):
+        """按当前 provider 创建或关闭 AsyncOpenAI 客户端"""
+        await self._close_openai_client()
+        if self.llm_provider != 'claude_openai' or not self.claude_openai_api_key:
+            return
+        try:
+            from openai import AsyncOpenAI
+        except ImportError as e:
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"[AI客服] 未安装 openai 包，无法使用 claude_openai: {e}"
+            )
+            return
+        self._openai_client = AsyncOpenAI(
+            api_key=self.claude_openai_api_key,
+            base_url=self.claude_openai_base_url,
+        )
+
+    def _claude_openai_extra_body(self) -> Optional[dict[str, Any]]:
+        """
+        Anthropic OpenAI 兼容层 extended thinking：
+        extra_body['thinking'] = {'type': 'enabled', 'budget_tokens': n}
+        配置见 ai_customer_service.claude_openai.thinking（enabled / effort / budget_tokens）。
+        """
+        t = self.claude_openai_thinking
+        if not t:
+            return None
+        if not t.get('enabled'):
+            return None
+        budget = t.get('budget_tokens')
+        if budget is None:
+            effort = str(t.get('effort', 'medium')).lower()
+            budget = {
+                'low': 2048,
+                'medium': 8000,
+                'high': 16000,
+            }.get(effort, 8000)
+        try:
+            budget_i = int(budget)
+        except (TypeError, ValueError):
+            budget_i = 8000
+        if budget_i < 1024:
+            budget_i = 1024
+        return {'thinking': {'type': 'enabled', 'budget_tokens': budget_i}}
 
     async def _admin_inject_after_modal_submit(
         self,
@@ -523,10 +612,10 @@ class AICustomerService(commands.Cog, name="AI客服"):
         """启动时从 Discord 拉回分类下各频道消息与管理子区，修复内存中的对话与映射"""
         if not self.auto_reply_enabled or not self.auto_reply_category_ids:
             return
-        if not self.api_key:
+        if not self._llm_configured():
             print(
                 f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-                "[AI客服] 跳过对话恢复：未配置 API Key",
+                "[AI客服] 跳过对话恢复：未配置当前 provider 所需的 API Key",
             )
             return
         if not self.session or self.session.closed:
@@ -792,6 +881,177 @@ class AICustomerService(commands.Cog, name="AI客服"):
             ]
         }]
 
+    def _system_prompt_text(self) -> str:
+        parts = self._build_system_instruction().get('parts', [])
+        return ''.join(
+            p.get('text', '')
+            for p in parts
+            if isinstance(p, dict) and 'text' in p
+        )
+
+    def _gemini_value_to_json_schema(self, node: dict) -> dict[str, Any]:
+        """将 Gemini functionDeclaration.parameters 转为 JSON Schema（OpenAI tools）。"""
+        if not node:
+            return {'type': 'object', 'properties': {}}
+        raw_t = str(node.get('type', 'OBJECT')).upper()
+        if raw_t == 'OBJECT':
+            out: dict[str, Any] = {'type': 'object'}
+            props = node.get('properties') or {}
+            if props:
+                out['properties'] = {
+                    k: self._gemini_value_to_json_schema(v)
+                    for k, v in props.items()
+                }
+            req = node.get('required')
+            if req:
+                out['required'] = list(req)
+            return out
+        if raw_t == 'ARRAY':
+            items = node.get('items')
+            return {
+                'type': 'array',
+                'items': self._gemini_value_to_json_schema(items)
+                if items
+                else {'type': 'string'},
+            }
+        scalar = {
+            'STRING': 'string',
+            'INTEGER': 'integer',
+            'NUMBER': 'number',
+            'BOOLEAN': 'boolean',
+        }.get(raw_t, 'string')
+        out: dict[str, Any] = {'type': scalar}
+        if node.get('description'):
+            out['description'] = node['description']
+        if 'enum' in node:
+            out['enum'] = list(node['enum'])
+        return out
+
+    def _build_openai_tools(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for decl in self._build_tools()[0].get('functionDeclarations', []):
+            params = decl.get('parameters') or {
+                'type': 'OBJECT',
+                'properties': {},
+            }
+            out.append({
+                'type': 'function',
+                'function': {
+                    'name': decl['name'],
+                    'description': decl.get('description', ''),
+                    'parameters': self._gemini_value_to_json_schema(params),
+                },
+            })
+        return out
+
+    def _gemini_user_parts_to_openai_content(
+        self, parts: list,
+    ) -> Union[str, list[dict[str, Any]]]:
+        chunks: list[dict[str, Any]] = []
+        for p in parts:
+            if not isinstance(p, dict):
+                continue
+            if 'text' in p:
+                chunks.append({'type': 'text', 'text': p['text']})
+            elif 'inlineData' in p:
+                mime = p['inlineData'].get('mimeType', 'application/octet-stream')
+                b64 = p['inlineData'].get('data', '')
+                if mime.startswith('image/'):
+                    chunks.append({
+                        'type': 'image_url',
+                        'image_url': {'url': f'data:{mime};base64,{b64}'},
+                    })
+                else:
+                    chunks.append({
+                        'type': 'text',
+                        'text': f'[非内联图片附件: {mime}]',
+                    })
+        if not chunks:
+            return ''
+        if len(chunks) == 1 and chunks[0]['type'] == 'text':
+            return chunks[0]['text']
+        return chunks
+
+    def _gemini_contents_to_openai_messages(self, contents: list) -> list[dict[str, Any]]:
+        """将内存中的 Gemini contents 转为 OpenAI Chat Completions messages（含 system）。"""
+        messages: list[dict[str, Any]] = []
+        sys_t = self._system_prompt_text()
+        if sys_t:
+            messages.append({'role': 'system', 'content': sys_t})
+
+        pending_tool_ids: list[str] = []
+        call_seq = 0
+
+        for bi, block in enumerate(contents):
+            if not isinstance(block, dict):
+                continue
+            role = block.get('role')
+            parts = block.get('parts') or []
+
+            if role == 'user':
+                if parts and all(
+                    isinstance(p, dict) and 'functionResponse' in p for p in parts
+                ):
+                    for j, p in enumerate(parts):
+                        fr = p['functionResponse']
+                        inner = fr.get('response', fr)
+                        payload = (
+                            inner
+                            if isinstance(inner, str)
+                            else json.dumps(inner, ensure_ascii=False)
+                        )
+                        tid = (
+                            pending_tool_ids[j]
+                            if j < len(pending_tool_ids)
+                            else f'legacy_{bi}_{j}'
+                        )
+                        messages.append({
+                            'role': 'tool',
+                            'tool_call_id': tid,
+                            'content': payload,
+                        })
+                    pending_tool_ids = []
+                    continue
+                messages.append({
+                    'role': 'user',
+                    'content': self._gemini_user_parts_to_openai_content(parts),
+                })
+            elif role == 'model':
+                text_buf: list[str] = []
+                tool_calls_oai: list[dict[str, Any]] = []
+                pending_tool_ids = []
+                for p in parts:
+                    if not isinstance(p, dict):
+                        continue
+                    if 'text' in p:
+                        text_buf.append(p['text'])
+                    elif 'functionCall' in p:
+                        fc = p['functionCall']
+                        call_seq += 1
+                        tid = f'call_{bi}_{call_seq}'
+                        pending_tool_ids.append(tid)
+                        args = fc.get('args', {})
+                        tool_calls_oai.append({
+                            'id': tid,
+                            'type': 'function',
+                            'function': {
+                                'name': fc['name'],
+                                'arguments': json.dumps(args, ensure_ascii=False)
+                                if args
+                                else '{}',
+                            },
+                        })
+                asst: dict[str, Any] = {'role': 'assistant'}
+                if text_buf:
+                    asst['content'] = ''.join(text_buf)
+                else:
+                    asst['content'] = None
+                if tool_calls_oai:
+                    asst['tool_calls'] = tool_calls_oai
+                messages.append(asst)
+
+        return messages
+
     async def _download_attachment(self, url: str) -> tuple[bytes, str]:
         try:
             async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -1007,6 +1267,164 @@ class AICustomerService(commands.Cog, name="AI客服"):
             return {'type': 'text', 'text': full_text, 'text_signature': text_signature}
         return {'type': 'empty'}
 
+    async def _call_claude_openai_stream(
+        self,
+        channel_id: int,
+        bot_message: discord.Message,
+    ) -> dict:
+        """
+        经 Anthropic [OpenAI SDK 兼容层](https://platform.claude.com/docs/en/api/openai-sdk)
+        调用 Claude（chat.completions + tools），流式更新 bot_message。
+        对话仍存为 Gemini 形态，请求前转换为 OpenAI messages。
+        """
+        if self._openai_client is None:
+            raise RuntimeError(
+                'OpenAI 兼容客户端未就绪：请设置 provider 为 claude_openai 并配置 API Key，'
+                '且已 pip 安装 openai'
+            )
+
+        history = self.conversations.get(channel_id, [])
+        messages = self._gemini_contents_to_openai_messages(history)
+        tools = self._build_openai_tools()
+
+        last_edit_time = 0.0
+        min_edit_interval = 1.0 / 3
+        max_retries = 3
+
+        for attempt in range(max_retries):
+            full_text = ''
+            tool_acc: dict[int, dict[str, str]] = {}
+            finish_reason: Optional[str] = None
+            try:
+                _ckwargs: dict[str, Any] = {
+                    'model': self.claude_openai_model,
+                    'messages': messages,
+                    'tools': tools,
+                    'max_tokens': self.claude_openai_max_tokens,
+                    'stream': True,
+                    'parallel_tool_calls': True,
+                }
+                _extra = self._claude_openai_extra_body()
+                if _extra:
+                    _ckwargs['extra_body'] = _extra
+                stream = await self._openai_client.chat.completions.create(
+                    **_ckwargs
+                )
+                async for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    ch0 = chunk.choices[0]
+                    if ch0.finish_reason:
+                        finish_reason = ch0.finish_reason
+                    delta = ch0.delta
+                    if getattr(delta, 'content', None):
+                        full_text += delta.content or ''
+                        now = time.monotonic()
+                        if now - last_edit_time >= min_edit_interval:
+                            try:
+                                display = (
+                                    full_text[:1997] + '...'
+                                    if len(full_text) > 2000
+                                    else full_text
+                                )
+                                await bot_message.edit(
+                                    content=display if display else '…'
+                                )
+                                last_edit_time = now
+                            except discord.HTTPException:
+                                pass
+                    tcd = getattr(delta, 'tool_calls', None)
+                    if tcd:
+                        for tc in tcd:
+                            idx = tc.index
+                            if idx not in tool_acc:
+                                tool_acc[idx] = {
+                                    'id': '',
+                                    'name': '',
+                                    'arguments': '',
+                                }
+                            if tc.id:
+                                tool_acc[idx]['id'] = tc.id
+                            fn = tc.function
+                            if fn:
+                                if fn.name:
+                                    tool_acc[idx]['name'] = fn.name
+                                if fn.arguments:
+                                    tool_acc[idx]['arguments'] += fn.arguments
+
+                break
+            except Exception as e:
+                msg = str(e).lower()
+                if attempt < max_retries - 1 and (
+                    '429' in msg or 'rate' in msg or 'overloaded' in msg
+                ):
+                    try:
+                        await bot_message.edit(
+                            content='⏳ Claude API 限流，数秒后重试...'
+                        )
+                    except discord.HTTPException:
+                        pass
+                    await asyncio.sleep(8)
+                    continue
+                raise
+
+        if full_text:
+            try:
+                disp = (
+                    full_text[:1997] + '...'
+                    if len(full_text) > 2000
+                    else full_text
+                )
+                await bot_message.edit(content=disp)
+            except discord.HTTPException:
+                pass
+
+        has_tools = bool(tool_acc) or finish_reason == 'tool_calls'
+        if has_tools and tool_acc:
+            tool_call_parts: list[dict] = []
+            for idx in sorted(tool_acc.keys()):
+                acc = tool_acc[idx]
+                name = acc.get('name', '')
+                if not name:
+                    continue
+                raw_args = acc.get('arguments') or '{}'
+                try:
+                    args_parsed = json.loads(raw_args) if raw_args else {}
+                except json.JSONDecodeError:
+                    args_parsed = {}
+                tool_call_parts.append({
+                    'functionCall': {
+                        'name': name,
+                        'args': args_parsed
+                        if isinstance(args_parsed, dict)
+                        else {},
+                    },
+                })
+            if tool_call_parts:
+                return {
+                    'type': 'tool_calls',
+                    'tool_call_parts': tool_call_parts,
+                    'text': full_text,
+                    'text_signature': None,
+                }
+
+        if full_text:
+            return {
+                'type': 'text',
+                'text': full_text,
+                'text_signature': None,
+            }
+        return {'type': 'empty'}
+
+    async def _call_llm_stream(
+        self,
+        channel_id: int,
+        bot_message: discord.Message,
+    ) -> dict:
+        if self.llm_provider == 'claude_openai':
+            return await self._call_claude_openai_stream(channel_id, bot_message)
+        return await self._call_gemini_stream(channel_id, bot_message)
+
     # ── 工具执行 ──────────────────────────────────────────────
 
     async def _execute_tool(self, tool_call: dict, channel: discord.abc.Messageable) -> dict:
@@ -1086,7 +1504,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
         max_tool_rounds = 5
 
         for _ in range(max_tool_rounds):
-            result = await self._call_gemini_stream(channel_id, bot_message)
+            result = await self._call_llm_stream(channel_id, bot_message)
 
             if result['type'] == 'text':
                 text = result['text']
@@ -1430,7 +1848,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
             return
         if message.channel.id not in self.active_channels:
             return
-        if not self.api_key:
+        if not self._llm_configured():
             return
 
         await self._handle_message(message)
@@ -1448,9 +1866,11 @@ class AICustomerService(commands.Cog, name="AI客服"):
         channel_id = interaction.channel.id
 
         if 操作 == "on":
-            if not self.api_key:
+            if not self._llm_configured():
                 await interaction.response.send_message(
-                    "❌ 未配置 Gemini API Key，请在配置文件中设置",
+                    "❌ 未配置 LLM API Key："
+                    "gemini 请设 ai_customer_service.gemini.api_key，"
+                    "claude_openai 请设 ai_customer_service.claude_openai.api_key",
                     ephemeral=True,
                 )
                 return

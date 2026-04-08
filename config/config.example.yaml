@@ -47,6 +47,24 @@ message_cleaner:
 
 # AI客服配置
 ai_customer_service:
+  # 模型后端：gemini | claude_openai（后者使用官方 openai 包对接 Anthropic 兼容端点）
+  # 说明：https://platform.claude.com/docs/en/api/openai-sdk
+  provider: gemini
+
+  claude_openai:
+    # Anthropic Console 中的 API Key；仅当 provider=claude_openai 时必填
+    api_key: ""
+    # 兼容层 Base URL，末尾需带 /
+    base_url: "https://api.anthropic.com/v1/"
+    model: "claude-sonnet-4-20250514"
+    max_tokens: 8192
+    # Extended thinking（经 extra_body 传给兼容层；流式下详细思考过程可能不可见）
+    # effort: low | medium | high — 映射为 budget_tokens；也可直接写 budget_tokens 覆盖
+    thinking:
+      enabled: false
+      effort: medium
+      # budget_tokens: 16000
+
   gemini:
     # Gemini API Key
     api_key: "YOUR_GEMINI_API_KEY"
