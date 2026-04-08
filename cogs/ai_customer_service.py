@@ -226,6 +226,9 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.claude_openai_thinking: Optional[dict[str, Any]] = (
             dict(raw_thinking) if isinstance(raw_thinking, dict) else None
         )
+        self.debug_stream_full_log = bool(
+            cfg.get('ai_customer_service.debug_stream_full_log', False)
+        )
 
         self.fetch_punishments_channel_id = int(
             cfg.get(
@@ -310,6 +313,26 @@ class AICustomerService(commands.Cog, name="AI客服"):
         if budget_i < 1024:
             budget_i = 1024
         return {'thinking': {'type': 'enabled', 'budget_tokens': budget_i}}
+
+    def _debug_log_after_stream(
+        self,
+        backend: str,
+        channel_id: int,
+        payload: dict[str, Any],
+    ) -> None:
+        """流式结束后全量打印模型侧信息（思考、工具、用量等），需开启 debug_stream_full_log"""
+        if not self.debug_stream_full_log:
+            return
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        except Exception as e:
+            print(f"[{ts}] [AI客服][stream_debug] JSON 序列化失败: {e}")
+            return
+        max_len = 200_000
+        if len(text) > max_len:
+            text = text[:max_len] + f'\n... [共截断 {len(text)} 字符]'
+        print(f"[{ts}] [AI客服][stream_debug] backend={backend} channel_id={channel_id}\n{text}")
 
     async def _admin_inject_after_modal_submit(
         self,
@@ -1162,6 +1185,9 @@ class AICustomerService(commands.Cog, name="AI客服"):
         last_edit_time = 0.0
         min_edit_interval = 1.0 / 3
         max_retries = 3
+        debug_gemini_thoughts: list[Any] = []
+        debug_gemini_usage: Any = None
+        debug_gemini_last_meta: dict[str, Any] = {}
 
         for attempt in range(max_retries):
             resp = await self.session.post(
@@ -1220,12 +1246,23 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 if finish_reason == 'SAFETY':
                     raise Exception("回复被安全策略拦截")
 
+                if self.debug_stream_full_log:
+                    debug_gemini_last_meta = {
+                        'finishReason': candidate.get('finishReason'),
+                        'safetyRatings': candidate.get('safetyRatings'),
+                    }
+
+                if 'usageMetadata' in data:
+                    if self.debug_stream_full_log:
+                        debug_gemini_usage = data['usageMetadata']
+
                 content = candidate.get('content', {})
                 parts = content.get('parts', [])
 
                 for part in parts:
-                    # 跳过思考摘要 part，不显示也不记录
                     if part.get('thought'):
+                        if self.debug_stream_full_log:
+                            debug_gemini_thoughts.append(part)
                         continue
                     if 'functionCall' in part:
                         fc_part = {'functionCall': part['functionCall']}
@@ -1257,15 +1294,34 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 pass
 
         if tool_call_parts:
-            return {
+            result: dict[str, Any] = {
                 'type': 'tool_calls',
                 'tool_call_parts': tool_call_parts,
                 'text': full_text,
                 'text_signature': text_signature,
             }
-        if full_text:
-            return {'type': 'text', 'text': full_text, 'text_signature': text_signature}
-        return {'type': 'empty'}
+        elif full_text:
+            result = {
+                'type': 'text',
+                'text': full_text,
+                'text_signature': text_signature,
+            }
+        else:
+            result = {'type': 'empty'}
+
+        if self.debug_stream_full_log:
+            self._debug_log_after_stream('gemini', channel_id, {
+                'gemini_model': self.model,
+                'proxy_url': self.proxy_url,
+                'response': result,
+                'assistant_visible_text': full_text,
+                'tool_call_parts': tool_call_parts,
+                'thought_parts_raw': debug_gemini_thoughts,
+                'usageMetadata': debug_gemini_usage,
+                'last_candidate_meta': debug_gemini_last_meta,
+                'text_signature': text_signature,
+            })
+        return result
 
     async def _call_claude_openai_stream(
         self,
@@ -1291,10 +1347,19 @@ class AICustomerService(commands.Cog, name="AI客服"):
         min_edit_interval = 1.0 / 3
         max_retries = 3
 
+        stream_chunk_count = 0
+        stream_reasoning_parts: list[str] = []
+        stream_debug_chunks: list[Any] = []
+        claude_usage_final: Any = None
+
         for attempt in range(max_retries):
             full_text = ''
-            tool_acc: dict[int, dict[str, str]] = {}
-            finish_reason: Optional[str] = None
+            tool_acc = {}
+            finish_reason = None
+            stream_chunk_count = 0
+            stream_reasoning_parts = []
+            stream_debug_chunks = []
+            claude_usage_final = None
             try:
                 _ckwargs: dict[str, Any] = {
                     'model': self.claude_openai_model,
@@ -1311,12 +1376,48 @@ class AICustomerService(commands.Cog, name="AI客服"):
                     **_ckwargs
                 )
                 async for chunk in stream:
+                    stream_chunk_count += 1
+                    if self.debug_stream_full_log:
+                        u_obj = getattr(chunk, 'usage', None)
+                        if u_obj is not None:
+                            try:
+                                claude_usage_final = (
+                                    u_obj.model_dump(exclude_none=True)
+                                    if hasattr(u_obj, 'model_dump')
+                                    else u_obj
+                                )
+                            except Exception:
+                                claude_usage_final = u_obj
+                        if hasattr(chunk, 'model_dump'):
+                            try:
+                                stream_debug_chunks.append(
+                                    chunk.model_dump(exclude_none=True)
+                                )
+                                if len(stream_debug_chunks) > 2000:
+                                    stream_debug_chunks = stream_debug_chunks[
+                                        -2000:
+                                    ]
+                            except Exception:
+                                pass
                     if not chunk.choices:
                         continue
                     ch0 = chunk.choices[0]
                     if ch0.finish_reason:
                         finish_reason = ch0.finish_reason
                     delta = ch0.delta
+                    if delta is not None and self.debug_stream_full_log:
+                        for attr in (
+                            'reasoning_content',
+                            'reasoning',
+                            'thinking',
+                            'refusal',
+                        ):
+                            try:
+                                v = getattr(delta, attr, None)
+                            except Exception:
+                                v = None
+                            if v:
+                                stream_reasoning_parts.append(f'[{attr}]{v!s}')
                     if getattr(delta, 'content', None):
                         full_text += delta.content or ''
                         now = time.monotonic()
@@ -1380,8 +1481,9 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 pass
 
         has_tools = bool(tool_acc) or finish_reason == 'tool_calls'
+        result_claude: dict[str, Any]
         if has_tools and tool_acc:
-            tool_call_parts: list[dict] = []
+            oai_tool_parts: list[dict] = []
             for idx in sorted(tool_acc.keys()):
                 acc = tool_acc[idx]
                 name = acc.get('name', '')
@@ -1392,7 +1494,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
                     args_parsed = json.loads(raw_args) if raw_args else {}
                 except json.JSONDecodeError:
                     args_parsed = {}
-                tool_call_parts.append({
+                oai_tool_parts.append({
                     'functionCall': {
                         'name': name,
                         'args': args_parsed
@@ -1400,21 +1502,44 @@ class AICustomerService(commands.Cog, name="AI客服"):
                         else {},
                     },
                 })
-            if tool_call_parts:
-                return {
+            if oai_tool_parts:
+                result_claude = {
                     'type': 'tool_calls',
-                    'tool_call_parts': tool_call_parts,
+                    'tool_call_parts': oai_tool_parts,
                     'text': full_text,
                     'text_signature': None,
                 }
-
-        if full_text:
-            return {
+            elif full_text:
+                result_claude = {
+                    'type': 'text',
+                    'text': full_text,
+                    'text_signature': None,
+                }
+            else:
+                result_claude = {'type': 'empty'}
+        elif full_text:
+            result_claude = {
                 'type': 'text',
                 'text': full_text,
                 'text_signature': None,
             }
-        return {'type': 'empty'}
+        else:
+            result_claude = {'type': 'empty'}
+
+        if self.debug_stream_full_log:
+            self._debug_log_after_stream('claude_openai', channel_id, {
+                'model': self.claude_openai_model,
+                'extra_body': self._claude_openai_extra_body(),
+                'finish_reason': finish_reason,
+                'stream_chunk_count': stream_chunk_count,
+                'reasoning_delta_joined': '\n'.join(stream_reasoning_parts),
+                'tool_calls_merged_raw': dict(tool_acc),
+                'response': result_claude,
+                'assistant_visible_text': full_text,
+                'sse_chunk_events': stream_debug_chunks,
+                'usage_final': claude_usage_final,
+            })
+        return result_claude
 
     async def _call_llm_stream(
         self,

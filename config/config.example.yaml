@@ -51,6 +51,9 @@ ai_customer_service:
   # 说明：https://platform.claude.com/docs/en/api/openai-sdk
   provider: gemini
 
+  # 流式结束后在控制台全量打印模型回复（含思考、工具合并结果、用量、SSE 片段等，日志可能很大）
+  debug_stream_full_log: false
+
   claude_openai:
     # Anthropic Console 中的 API Key；仅当 provider=claude_openai 时必填
     api_key: ""
