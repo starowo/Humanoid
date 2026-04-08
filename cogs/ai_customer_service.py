@@ -19,6 +19,12 @@ import re
 # send_to_admin 工具发往管理区/子区的正文前缀，用于恢复持久化按钮
 _ADMIN_TOOL_MESSAGE_HEADER = re.compile(r"^\*\*来自 <#(\d+)>：\*\*", re.MULTILINE)
 
+# Discord 消息/子区链接：group1 guild, group2 channel_or_thread_id, group3 optional message_id
+_DISCORD_CHANNEL_LINK_RE = re.compile(
+    r"https?://(?:discord(?:app)?\.com)/channels/(\d+)/(\d+)(?:/(\d+))?",
+    re.IGNORECASE,
+)
+
 
 def _admin_inject_button_custom_id(source_channel_id: int, admin_message_id: int) -> str:
     """持久化按钮 custom_id（单条管理消息唯一，便于重启后 edit + add_view）"""
@@ -416,6 +422,179 @@ class AICustomerService(commands.Cog, name="AI客服"):
             lines.append(embed.footer.text)
         return "\n".join(lines).strip()
 
+    @staticmethod
+    def _parse_discord_links_from_text(text: str) -> list[tuple[int, int, Optional[int]]]:
+        """从文本中提取 (guild_id, channel_or_thread_id, message_id|None)，去重保序。"""
+        seen: set[tuple[int, int, Optional[int]]] = set()
+        out: list[tuple[int, int, Optional[int]]] = []
+        for m in _DISCORD_CHANNEL_LINK_RE.finditer(text or ''):
+            g, c = int(m.group(1)), int(m.group(2))
+            mid_s = m.group(3)
+            mid: Optional[int] = int(mid_s) if mid_s else None
+            key = (g, c, mid)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((g, c, mid))
+        return out
+
+    @staticmethod
+    def _is_forum_post_thread(ch: discord.abc.GuildChannel) -> bool:
+        return (
+            isinstance(ch, discord.Thread)
+            and ch.parent is not None
+            and isinstance(ch.parent, discord.ForumChannel)
+        )
+
+    def _format_single_message_for_fetch(
+        self,
+        m: discord.Message,
+        *,
+        highlight: bool = False,
+    ) -> str:
+        """单条消息：正文、附件/图片 URL、embed 摘要。"""
+        marker = ">>>" if highlight else "   "
+        ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        author = m.author
+        aname = author.display_name if author else '?'
+        aid = author.id if author else 0
+        text = m.content or '(无文本)'
+        lines = [f'{marker} [{ts}] {aname} ({aid}): {text}']
+        if m.attachments:
+            for a in m.attachments:
+                ct = a.content_type or 'unknown'
+                lines.append(f'     [附件] {a.filename} | {ct}')
+                lines.append(f'     [URL] {a.url}')
+                if ct.startswith('image/'):
+                    lines.append('     [图片] 见上 URL')
+        if m.stickers:
+            for s in m.stickers:
+                lines.append(f'     [贴纸] {s.name} (id={s.id})')
+        if m.embeds:
+            for i, emb in enumerate(m.embeds):
+                plain = self._embed_to_plain_text(emb)
+                tag = f'[embed {i + 1}]'
+                if plain:
+                    indented = '\n'.join(f'     {ln}' for ln in plain.splitlines())
+                    lines.append(f'     {tag}\n{indented}')
+                else:
+                    lines.append(f'     {tag} (无可解析文本)')
+        return '\n'.join(lines)
+
+    async def _fetch_messages_anchored(
+        self,
+        target_ch: discord.abc.Messageable,
+        msg_id: int,
+    ) -> tuple[str, list[discord.Message]]:
+        target_msg = await target_ch.fetch_message(msg_id)
+        msgs_before: list[discord.Message] = []
+        async for m in target_ch.history(limit=25, before=target_msg):
+            msgs_before.append(m)
+        msgs_before.reverse()
+        msgs_after: list[discord.Message] = []
+        async for m in target_ch.history(limit=25, after=target_msg):
+            msgs_after.append(m)
+        all_msgs = msgs_before + [target_msg] + msgs_after
+        text = '\n'.join(
+            self._format_single_message_for_fetch(m, highlight=(m.id == msg_id))
+            for m in all_msgs
+        )
+        return text, all_msgs
+
+    async def _fetch_forum_thread_without_message_id(
+        self,
+        thread: discord.Thread,
+    ) -> tuple[str, list[discord.Message]]:
+        """论坛帖：最早 25 条 + 最近 25 条（去重）。返回正文与按浏览顺序的消息列表（用于多模态图片）。"""
+        oldest: list[discord.Message] = []
+        async for m in thread.history(limit=25, oldest_first=True):
+            oldest.append(m)
+        newest: list[discord.Message] = []
+        async for m in thread.history(limit=25):
+            newest.append(m)
+        newest.reverse()
+        seen: set[int] = set()
+        ordered: list[discord.Message] = []
+        parts: list[str] = ['=== 论坛帖：较早（至多25条，按时间升序） ===']
+        for m in oldest:
+            if m.id not in seen:
+                seen.add(m.id)
+                ordered.append(m)
+                parts.append(self._format_single_message_for_fetch(m))
+        parts.append('=== 论坛帖：最近（至多25条，按时间升序） ===')
+        for m in newest:
+            if m.id not in seen:
+                seen.add(m.id)
+                ordered.append(m)
+                parts.append(self._format_single_message_for_fetch(m))
+        return '\n'.join(parts), ordered
+
+    def _gather_fetch_image_urls(
+        self,
+        msgs: list[discord.Message],
+    ) -> list[tuple[str, str]]:
+        """从已拉取的消息中收集 (url, mime_hint)，顺序与消息时间一致。"""
+        sources: list[tuple[str, str]] = []
+        for m in msgs:
+            for att in m.attachments:
+                ct = (att.content_type or '').lower()
+                if ct.startswith('image/'):
+                    sources.append((att.url, ct.split(';')[0].strip() or 'image/jpeg'))
+                    continue
+                fn = (att.filename or '').lower()
+                if fn.endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+                    guess = 'image/jpeg'
+                    if fn.endswith('.png'):
+                        guess = 'image/png'
+                    elif fn.endswith('.gif'):
+                        guess = 'image/gif'
+                    elif fn.endswith('.webp'):
+                        guess = 'image/webp'
+                    sources.append((att.url, guess))
+            for emb in m.embeds:
+                url = None
+                if emb.image and emb.image.url:
+                    url = str(emb.image.url)
+                elif emb.thumbnail and emb.thumbnail.url:
+                    url = str(emb.thumbnail.url)
+                if url:
+                    sources.append((url, 'image/png'))
+        return sources
+
+    async def _build_fetch_image_inline_gemini_parts(
+        self,
+        msgs: list[discord.Message],
+        *,
+        max_images: int = 24,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """下载图片为 Gemini inlineData parts；返回 (parts, 因张数上限跳过的剩余图数)。"""
+        raw_urls = self._gather_fetch_image_urls(msgs)
+        seen_u: set[str] = set()
+        urls: list[tuple[str, str]] = []
+        for u, m in raw_urls:
+            if u in seen_u:
+                continue
+            seen_u.add(u)
+            urls.append((u, m))
+        out: list[dict[str, Any]] = []
+        skipped = max(0, len(urls) - max_images)
+        for url, hint_mime in urls[:max_images]:
+            data, content_type = await self._download_attachment(url)
+            if not data or len(data) > self.max_attachment_size:
+                skipped += 1
+                continue
+            mime = (content_type or '').split(';')[0].strip().lower()
+            if not mime.startswith('image/'):
+                mime = hint_mime if hint_mime.startswith('image/') else 'image/png'
+            b64 = base64.b64encode(data).decode('ascii')
+            out.append({
+                'inlineData': {
+                    'mimeType': mime,
+                    'data': b64,
+                }
+            })
+        return out, skipped
+
     async def _format_user_mentions_in_text(
         self,
         text: str,
@@ -631,6 +810,60 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
         return conv, complainant_id
 
+    async def _restore_one_complaint_channel(
+        self,
+        ch: discord.TextChannel,
+        *,
+        admin_parent: Optional[discord.abc.GuildChannel] = None,
+    ) -> str:
+        """
+        从 Discord 恢复单个监控分类下的投诉文字频道（与启动时批量恢复同逻辑）：
+        对话历史、投诉人、管理子区映射与注入按钮重绑。
+        会加入 active_channels。
+        """
+        conv, complainant_id = await self._rebuild_conversation_from_history(ch)
+        self.conversations[ch.id] = conv
+        self.active_channels.add(ch.id)
+        if complainant_id is not None:
+            self.channel_complainants[ch.id] = complainant_id
+        else:
+            self.channel_complainants.pop(ch.id, None)
+
+        ap = admin_parent
+        if ap is None and self.admin_channel_id:
+            ap = self.bot.get_channel(self.admin_channel_id)
+            if not ap:
+                try:
+                    ap = await self.bot.fetch_channel(self.admin_channel_id)
+                except Exception:
+                    ap = None
+
+        mapped: Optional[discord.Thread] = None
+        rebound = 0
+        if ap:
+            mapped = await self._find_admin_thread_by_channel_name(ap, ch.name)
+            if mapped:
+                self.channel_threads[ch.id] = mapped
+                rebound = await self._reregister_admin_inject_views_in_thread(
+                    mapped, ch.id
+                )
+            else:
+                self.channel_threads.pop(ch.id, None)
+        else:
+            self.channel_threads.pop(ch.id, None)
+
+        if mapped and rebound:
+            tip = f"+管理子区 #{mapped.name}，已恢复 {rebound} 条「发送指令」按钮"
+        elif mapped:
+            tip = f"+管理子区 #{mapped.name}"
+        else:
+            tip = "（未匹配管理子区）"
+        print(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"[AI客服] 已恢复 #{ch.name}（{len(conv)} 轮对话）{tip}",
+        )
+        return tip
+
     async def _restore_auto_reply_state(self):
         """启动时从 Discord 拉回分类下各频道消息与管理子区，修复内存中的对话与映射"""
         if not self.auto_reply_enabled or not self.auto_reply_category_ids:
@@ -670,35 +903,10 @@ class AICustomerService(commands.Cog, name="AI客服"):
                     continue
                 for ch in category.text_channels:
                     try:
-                        conv, complainant_id = await self._rebuild_conversation_from_history(ch)
-                        self.conversations[ch.id] = conv
-                        self.active_channels.add(ch.id)
-                        if complainant_id is not None:
-                            self.channel_complainants[ch.id] = complainant_id
-
-                        mapped: Optional[discord.Thread] = None
-                        rebound = 0
-                        if admin_parent:
-                            mapped = await self._find_admin_thread_by_channel_name(
-                                admin_parent, ch.name
-                            )
-                            if mapped:
-                                self.channel_threads[ch.id] = mapped
-                                rebound = await self._reregister_admin_inject_views_in_thread(
-                                    mapped, ch.id
-                                )
-
-                        restored += 1
-                        if mapped and rebound:
-                            tip = f"+管理子区 #{mapped.name}，已恢复 {rebound} 条「发送指令」按钮"
-                        elif mapped:
-                            tip = f"+管理子区 #{mapped.name}"
-                        else:
-                            tip = "（未匹配管理子区）"
-                        print(
-                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-                            f"[AI客服] 已恢复 #{ch.name}（{len(conv)} 轮对话）{tip}",
+                        await self._restore_one_complaint_channel(
+                            ch, admin_parent=admin_parent
                         )
+                        restored += 1
                     except Exception as e:
                         print(
                             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
@@ -881,16 +1089,25 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 },
                 {
                     "name": "fetch_messages",
-                    "description": "根据 Discord 消息链接获取该消息前后各25条聊天记录，用于查看用户提供的消息链接上下文",
+                    "description": (
+                        "根据一条或多条 Discord 链接获取聊天上下文。完整消息链接：目标前后各25条，含附件 URL、embed "
+                        "文本与 embed 缩略图/大图；其中站内图片会同时注入多模态视觉上下文。论坛帖子可无消息ID：最早+最近各25条。"
+                        "普通文字频道无消息ID则无法读取。"
+                    ),
                     "parameters": {
                         "type": "OBJECT",
                         "properties": {
-                            "message_link": {
-                                "type": "STRING",
-                                "description": "Discord 消息链接，格式如 https://discord.com/channels/服务器ID/频道ID/消息ID"
+                            "message_links": {
+                                "type": "ARRAY",
+                                "items": {"type": "STRING"},
+                                "description": (
+                                    "Discord 链接列表；也允许把多条链接用换行写在同一个字符串元素里。"
+                                    "示例：含消息 https://discord.com/channels/gid/cid/mid ；论坛帖仅子区 "
+                                    "https://discord.com/channels/gid/thread_id"
+                                ),
                             }
                         },
-                        "required": ["message_link"]
+                        "required": ["message_links"]
                     }
                 },
                 {
@@ -1035,6 +1252,79 @@ class AICustomerService(commands.Cog, name="AI客服"):
                         })
                     pending_tool_ids = []
                     continue
+
+                def _part_is_fr(p: Any) -> bool:
+                    return isinstance(p, dict) and 'functionResponse' in p
+
+                def _part_is_inline(p: Any) -> bool:
+                    return isinstance(p, dict) and 'inlineData' in p
+
+                if parts and any(_part_is_fr(p) for p in parts):
+                    fr_idx = 0
+                    i = 0
+                    while i < len(parts):
+                        p = parts[i]
+                        if not _part_is_fr(p):
+                            j = i
+                            while j < len(parts) and not _part_is_fr(parts[j]):
+                                j += 1
+                            chunk = parts[i:j]
+                            messages.append({
+                                'role': 'user',
+                                'content': self._gemini_user_parts_to_openai_content(
+                                    chunk
+                                ),
+                            })
+                            i = j
+                            continue
+                        fr = p['functionResponse']
+                        inner = fr.get('response', fr)
+                        text_payload = (
+                            inner
+                            if isinstance(inner, str)
+                            else json.dumps(inner, ensure_ascii=False)
+                        )
+                        tid = (
+                            pending_tool_ids[fr_idx]
+                            if fr_idx < len(pending_tool_ids)
+                            else f'legacy_{bi}_{fr_idx}'
+                        )
+                        fr_idx += 1
+                        i += 1
+                        inline_chunk: list[dict[str, Any]] = []
+                        while i < len(parts) and _part_is_inline(parts[i]):
+                            inline_chunk.append(parts[i])
+                            i += 1
+                        if inline_chunk:
+                            oai_content: list[dict[str, Any]] = [
+                                {'type': 'text', 'text': text_payload},
+                            ]
+                            for ip in inline_chunk:
+                                mime = ip['inlineData'].get(
+                                    'mimeType', 'application/octet-stream'
+                                )
+                                b64 = ip['inlineData'].get('data', '')
+                                if mime.startswith('image/'):
+                                    oai_content.append({
+                                        'type': 'image_url',
+                                        'image_url': {
+                                            'url': f'data:{mime};base64,{b64}',
+                                        },
+                                    })
+                            messages.append({
+                                'role': 'tool',
+                                'tool_call_id': tid,
+                                'content': oai_content,
+                            })
+                        else:
+                            messages.append({
+                                'role': 'tool',
+                                'tool_call_id': tid,
+                                'content': text_payload,
+                            })
+                    pending_tool_ids = []
+                    continue
+
                 messages.append({
                     'role': 'user',
                     'content': self._gemini_user_parts_to_openai_content(parts),
@@ -1582,39 +1872,83 @@ class AICustomerService(commands.Cog, name="AI客服"):
             return {"result": "已静默处理"}
 
         if name == 'fetch_messages':
-            link = args.get('message_link', '')
-            match = re.search(r'channels/(\d+)/(\d+)/(\d+)', link)
-            if not match:
-                return {"error": "无效的消息链接格式"}
+            raw = args.get('message_links')
+            if raw is None:
+                raw = args.get('message_link')
+            if raw is None:
+                return {"error": "请提供 message_links（字符串数组，内含一条或多条 Discord 链接）"}
+            if isinstance(raw, str):
+                blocks = [raw]
+            elif isinstance(raw, list):
+                blocks = [str(x) for x in raw if x is not None]
+            else:
+                blocks = [str(raw)]
 
-            ch_id, msg_id = int(match.group(2)), int(match.group(3))
-            try:
-                target_ch = self.bot.get_channel(ch_id)
-                if not target_ch:
-                    target_ch = await self.bot.fetch_channel(ch_id)
-                target_msg = await target_ch.fetch_message(msg_id)
-            except Exception:
-                return {"error": "无法获取目标消息，可能无权限或消息不存在"}
+            triples: list[tuple[int, int, Optional[int]]] = []
+            for b in blocks:
+                triples.extend(self._parse_discord_links_from_text(b))
+            if not triples:
+                return {"error": "未解析到有效 Discord 链接（需 discord.com/channels/服务器ID/频道或子区ID/可选消息ID）"}
 
-            msgs_before = []
-            async for m in target_ch.history(limit=25, before=target_msg):
-                msgs_before.append(m)
-            msgs_before.reverse()
+            sections: list[str] = []
+            collected_msgs: list[discord.Message] = []
+            for gi, (_g_id, ch_id, msg_id) in enumerate(triples, 1):
+                sec_head = f"--- 链接 {gi} (频道/子区 {ch_id}) ---"
+                try:
+                    target_ch = self.bot.get_channel(ch_id)
+                    if not target_ch:
+                        target_ch = await self.bot.fetch_channel(ch_id)
+                except Exception:
+                    sections.append(f"{sec_head}\n错误: 无法访问该频道或子区")
+                    continue
 
-            msgs_after = []
-            async for m in target_ch.history(limit=25, after=target_msg):
-                msgs_after.append(m)
+                if msg_id is not None:
+                    try:
+                        body, msgs = await self._fetch_messages_anchored(target_ch, msg_id)
+                        collected_msgs.extend(msgs)
+                        sections.append(f"{sec_head}\n目标消息 {msg_id} 前后上下文:\n{body}")
+                    except Exception as e:
+                        sections.append(f"{sec_head}\n错误: 无法读取该消息或上下文 ({e})")
+                    continue
 
-            all_msgs = msgs_before + [target_msg] + msgs_after
-            lines = []
-            for m in all_msgs:
-                marker = ">>>" if m.id == msg_id else "   "
-                ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
-                text = m.content or "(无文本)"
-                atts = f" [附件: {', '.join(a.filename for a in m.attachments)}]" if m.attachments else ""
-                lines.append(f"{marker} [{ts}] {m.author.display_name} ({m.author.id}): {text}{atts}")
+                if self._is_forum_post_thread(target_ch):
+                    try:
+                        body, msgs = await self._fetch_forum_thread_without_message_id(
+                            target_ch
+                        )
+                        collected_msgs.extend(msgs)
+                        sections.append(
+                            f"{sec_head}\n论坛帖已按「最早25条 + 最近25条」拉取:\n{body}"
+                        )
+                    except Exception as e:
+                        sections.append(f"{sec_head}\n错误: 论坛帖历史读取失败 ({e})")
+                    continue
 
-            return {"messages": "\n".join(lines)}
+                if isinstance(target_ch, discord.Thread):
+                    sections.append(
+                        f"{sec_head}\n错误: 该子区非论坛公开帖，请使用带「消息ID」的完整链接"
+                    )
+                    continue
+
+                sections.append(
+                    f"{sec_head}\n错误: 普通文字频道必须提供消息ID，无法在仅频道链接下读取历史"
+                )
+
+            out = '\n\n'.join(sections)
+            max_len = 120_000
+            if len(out) > max_len:
+                out = out[: max_len - 80] + '\n\n...(总输出过长已截断，请减少链接数量或缩短范围)'
+            image_inline_parts, img_skipped = await self._build_fetch_image_inline_gemini_parts(
+                collected_msgs
+            )
+            if img_skipped:
+                out = (
+                    f"{out}\n\n（另有 {img_skipped} 张图片未加入多模态上下文：超过单工具上限或未下载）"
+                )
+            payload: dict[str, Any] = {'messages': out}
+            if image_inline_parts:
+                payload['image_inline_parts'] = image_inline_parts
+            return payload
 
         return {"error": f"未知工具: {name}"}
 
@@ -1664,12 +1998,30 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 for tc_part in result['tool_call_parts']:
                     fc = tc_part['functionCall']
                     tool_result = await self._execute_tool(fc, channel)
-                    func_resp_parts.append({
-                        "functionResponse": {
-                            "name": fc['name'],
-                            "response": {"content": tool_result},
+                    fn = fc['name']
+                    if fn == 'fetch_messages' and isinstance(tool_result, dict):
+                        imgs = tool_result.get('image_inline_parts') or []
+                        content_obj = {
+                            k: v
+                            for k, v in tool_result.items()
+                            if k != 'image_inline_parts'
                         }
-                    })
+                        func_resp_parts.append({
+                            'functionResponse': {
+                                'name': fn,
+                                'response': {'content': content_obj},
+                            }
+                        })
+                        for ip in imgs:
+                            if isinstance(ip, dict) and 'inlineData' in ip:
+                                func_resp_parts.append(ip)
+                    else:
+                        func_resp_parts.append({
+                            'functionResponse': {
+                                'name': fn,
+                                'response': {'content': tool_result},
+                            }
+                        })
                     if fc['name'] == 'exit_conversation':
                         exit_called = True
                     elif fc['name'] == 'no_response':
@@ -2000,9 +2352,43 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 )
                 return
             self.active_channels.add(channel_id)
-            if channel_id not in self.conversations:
-                self.conversations[channel_id] = []
-            await interaction.response.send_message("✅ AI客服已在此频道开启", ephemeral=True)
+            ch = interaction.channel
+            follow: list[str] = []
+            if (
+                isinstance(ch, discord.TextChannel)
+                and self.auto_reply_category_ids
+                and ch.category_id in self.auto_reply_category_ids
+            ):
+                if not self.session or self.session.closed:
+                    if channel_id not in self.conversations:
+                        self.conversations[channel_id] = []
+                    follow.append("\n⚠️ HTTP 会话未就绪，无法从历史拉取上下文（空对话）。")
+                else:
+                    try:
+                        await self._restore_one_complaint_channel(ch)
+                        n_after = len(self.conversations.get(channel_id, []))
+                        follow.append(
+                            f"\n已从本频道消息历史恢复 **{n_after}** 轮模型上下文（与启动恢复逻辑相同）。"
+                        )
+                    except Exception as e:
+                        self.conversations.pop(channel_id, None)
+                        self.channel_complainants.pop(channel_id, None)
+                        self.channel_threads.pop(channel_id, None)
+                        if channel_id not in self.conversations:
+                            self.conversations[channel_id] = []
+                        follow.append(
+                            f"\n⚠️ 历史恢复失败，已使用空上下文：{str(e)[:120]}"
+                        )
+                        print(
+                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                            f"[AI客服] 手动开启时恢复 #{ch.name} 失败: {e}"
+                        )
+            else:
+                if channel_id not in self.conversations:
+                    self.conversations[channel_id] = []
+            await interaction.response.send_message(
+                "✅ AI客服已在此频道开启" + "".join(follow), ephemeral=True
+            )
             print(
                 f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
                 f"[AI客服] 手动开启: #{interaction.channel.name} "
