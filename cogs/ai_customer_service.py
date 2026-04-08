@@ -25,6 +25,12 @@ def _admin_inject_button_custom_id(source_channel_id: int, admin_message_id: int
     return f"humanoid_ai_inj_{source_channel_id}_{admin_message_id}"
 
 
+def _admin_preset_button_custom_id(
+    source_channel_id: int, admin_message_id: int, preset_index: int
+) -> str:
+    return f"humanoid_ai_pr_{source_channel_id}_{admin_message_id}_{preset_index}"
+
+
 class AdminInjectModal(discord.ui.Modal, title="向AI发送隐藏指令"):
     """管理员快速注入指令的弹出表单"""
     指令 = discord.ui.TextInput(
@@ -40,55 +46,32 @@ class AdminInjectModal(discord.ui.Modal, title="向AI发送隐藏指令"):
         self.source_channel_id = source_channel_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        channel_id = self.source_channel_id
-        channel = self.cog.bot.get_channel(channel_id)
-        if not channel:
-            await interaction.response.send_message("❌ 无法找到来源频道", ephemeral=True)
-            return
-        if channel_id not in self.cog.active_channels:
-            await interaction.response.send_message("❌ 该频道AI客服已关闭", ephemeral=True)
-            return
-        if channel_id in self.cog.processing_channels:
-            await interaction.response.send_message("⏳ 该频道正在处理中，请稍后重试", ephemeral=True)
-            return
+        await self.cog._admin_inject_after_modal_submit(
+            interaction, self.source_channel_id, self.指令.value
+        )
 
-        msg_text = self.指令.value
 
-        self.cog.processing_channels.add(channel_id)
-        try:
-            if channel_id not in self.cog.conversations:
-                self.cog.conversations[channel_id] = []
-            self.cog.conversations[channel_id].append({
-                "role": "user",
-                "parts": [{"text": f"<odyxml:admin>{msg_text}</odyxml:admin>"}],
-            })
+class AdminPresetModal(discord.ui.Modal):
+    """预设指令：弹出时已填入展开变量后的正文，确认即发送"""
 
-            await interaction.response.send_message(
-                f"✅ 已向 <#{channel_id}> 注入指令\n> {msg_text}",
-                ephemeral=True,
-            )
+    def __init__(self, cog: "AICustomerService", source_channel_id: int, title: str, body: str):
+        super().__init__(title=title[:45])
+        self.cog = cog
+        self.source_channel_id = source_channel_id
+        safe = body if len(body) <= 4000 else body[:3997] + "..."
+        self._body = discord.ui.TextInput(
+            label="内容（可修改后发送）",
+            style=discord.TextStyle.paragraph,
+            default=safe,
+            required=True,
+            max_length=4000,
+        )
+        self.add_item(self._body)
 
-            mention_user = None
-            async for msg in channel.history(limit=50):
-                if not msg.author.bot and isinstance(msg.author, discord.Member) and not self.cog._is_admin(msg.author):
-                    mention_user = msg.author
-                    break
-
-            if mention_user:
-                bot_message = await channel.send(mention_user.mention)
-                await bot_message.edit(content="💭 思考中...")
-            else:
-                bot_message = await channel.send("💭 思考中...")
-
-            await self.cog._generate_response(channel, channel_id, bot_message)
-        except Exception as e:
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [AI客服] 表单注入错误: {e}")
-            try:
-                await channel.send(f"❌ AI回复出错: {str(e)[:200]}")
-            except Exception:
-                pass
-        finally:
-            self.cog.processing_channels.discard(channel_id)
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog._admin_inject_after_modal_submit(
+            interaction, self.source_channel_id, self._body.value
+        )
 
 
 class AdminInjectView(discord.ui.View):
@@ -107,6 +90,35 @@ class AdminInjectView(discord.ui.View):
         )
         btn.callback = self._inject_button_callback
         self.add_item(btn)
+
+        def bind_preset(preset_label: str, preset_body: str):
+            async def _preset_callback(interaction: discord.Interaction):
+                if not isinstance(interaction.user, discord.Member) or not self.cog._is_admin(
+                    interaction.user
+                ):
+                    await interaction.response.send_message("❌ 你没有权限", ephemeral=True)
+                    return
+                expanded = await self.cog._expand_preset_variables(preset_body)
+                await interaction.response.send_modal(
+                    AdminPresetModal(self.cog, self.source_channel_id, preset_label, expanded)
+                )
+
+            return _preset_callback
+
+        max_presets = min(len(cog.send_to_admin_preset_buttons), 24)
+        for idx in range(max_presets):
+            preset = cog.send_to_admin_preset_buttons[idx]
+            plabel = str(preset.get("label", "预设"))[:80]
+            pcontent = str(preset.get("content", ""))
+            pbtn = discord.ui.Button(
+                label=plabel,
+                style=discord.ButtonStyle.secondary,
+                custom_id=_admin_preset_button_custom_id(
+                    source_channel_id, admin_message_id, idx
+                ),
+            )
+            pbtn.callback = bind_preset(plabel, pcontent)
+            self.add_item(pbtn)
 
     async def _inject_button_callback(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member) or not self.cog._is_admin(interaction.user):
@@ -185,10 +197,189 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.max_history = cfg.get('ai_customer_service.max_history', 50)
         self.max_attachment_size = cfg.get('ai_customer_service.max_attachment_size', 10 * 1024 * 1024)
         self.allowed_role_ids = cfg.get('allowed_role_ids', [])
+        self.fetch_punishments_channel_id = int(
+            cfg.get(
+                'ai_customer_service.send_to_admin_presets.fetch_punishments_channel_id',
+                0,
+            )
+            or 0
+        )
+        raw_presets = cfg.get('ai_customer_service.send_to_admin_presets.buttons', [])
+        self.send_to_admin_preset_buttons: list[dict] = []
+        if isinstance(raw_presets, list):
+            for p in raw_presets:
+                if (
+                    isinstance(p, dict)
+                    and p.get('label') is not None
+                    and p.get('content') is not None
+                ):
+                    self.send_to_admin_preset_buttons.append({
+                        'label': str(p['label']),
+                        'content': str(p['content']),
+                    })
 
     async def on_config_reload(self):
         """配置重载回调"""
         self.load_config()
+
+    async def _admin_inject_after_modal_submit(
+        self,
+        interaction: discord.Interaction,
+        channel_id: int,
+        msg_text: str,
+    ):
+        channel = self.bot.get_channel(channel_id)
+        if not channel:
+            await interaction.response.send_message("❌ 无法找到来源频道", ephemeral=True)
+            return
+        if channel_id not in self.active_channels:
+            await interaction.response.send_message("❌ 该频道AI客服已关闭", ephemeral=True)
+            return
+        if channel_id in self.processing_channels:
+            await interaction.response.send_message(
+                "⏳ 该频道正在处理中，请稍后重试",
+                ephemeral=True,
+            )
+            return
+
+        self.processing_channels.add(channel_id)
+        try:
+            if channel_id not in self.conversations:
+                self.conversations[channel_id] = []
+            self.conversations[channel_id].append({
+                "role": "user",
+                "parts": [{"text": f"<odyxml:admin>{msg_text}</odyxml:admin>"}],
+            })
+
+            await interaction.response.send_message(
+                f"✅ 已向 <#{channel_id}> 注入指令\n> {msg_text}",
+                ephemeral=True,
+            )
+
+            mention_user = None
+            async for msg in channel.history(limit=50):
+                au = msg.author
+                if (
+                    not msg.author.bot
+                    and isinstance(au, discord.Member)
+                    and not self._is_admin(au)
+                ):
+                    mention_user = au
+                    break
+
+            if mention_user:
+                bot_message = await channel.send(mention_user.mention)
+                await bot_message.edit(content="💭 思考中...")
+            else:
+                bot_message = await channel.send("💭 思考中...")
+
+            await self._generate_response(channel, channel_id, bot_message)
+        except Exception as e:
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"[AI客服] 表单注入错误: {e}"
+            )
+            try:
+                await channel.send(f"❌ AI回复出错: {str(e)[:200]}")
+            except Exception:
+                pass
+        finally:
+            self.processing_channels.discard(channel_id)
+
+    @staticmethod
+    def _embed_to_plain_text(embed: discord.Embed) -> str:
+        lines: list[str] = []
+        if embed.title:
+            lines.append(embed.title)
+        if embed.description:
+            lines.append(embed.description)
+        if embed.author and embed.author.name:
+            lines.append(embed.author.name)
+        for field in embed.fields:
+            if field.name:
+                lines.append(field.name)
+            if field.value:
+                lines.append(field.value)
+        if embed.footer and embed.footer.text:
+            lines.append(embed.footer.text)
+        return "\n".join(lines).strip()
+
+    async def _format_user_mentions_in_text(
+        self,
+        text: str,
+        guild: Optional[discord.Guild],
+    ) -> str:
+        """将 <@id> 转为 用户昵称（用户名）（数字id）"""
+        if not text:
+            return text
+        pattern = re.compile(r"<@!?(\d+)>")
+
+        async def uid_to_label(uid: int) -> str:
+            if guild is not None:
+                member = guild.get_member(uid)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(uid)
+                    except discord.NotFound:
+                        member = None
+                if member is not None:
+                    return f"{member.display_name}（{member.name}）（{member.id}）"
+            try:
+                user = await self.bot.fetch_user(uid)
+                return f"{user.display_name}（{user.name}）（{user.id}）"
+            except Exception:
+                return f"用户（?）（{uid}）"
+
+        chunks: list[str] = []
+        pos = 0
+        for m in pattern.finditer(text):
+            chunks.append(text[pos : m.start()])
+            chunks.append(await uid_to_label(int(m.group(1))))
+            pos = m.end()
+        chunks.append(text[pos:])
+        return "".join(chunks)
+
+    async def _expand_fetch_punishments(self) -> str:
+        """%fetch_punishments%：在最近 10 条消息中取含 embed 的条目并格式化"""
+        cid = self.fetch_punishments_channel_id
+        if not cid:
+            return "（未配置 send_to_admin_presets.fetch_punishments_channel_id）"
+        ch = self.bot.get_channel(cid)
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(cid)
+            except Exception:
+                return "（无法访问处罚记录频道）"
+        if not isinstance(ch, discord.TextChannel):
+            return "（处罚记录频道不是文字频道）"
+        guild = ch.guild
+        embed_msgs: list[discord.Message] = []
+        async for msg in ch.history(limit=10):
+            if msg.embeds:
+                embed_msgs.append(msg)
+        embed_msgs.reverse()
+        blocks: list[str] = []
+        for msg in embed_msgs:
+            parts: list[str] = []
+            for emb in msg.embeds:
+                plain = self._embed_to_plain_text(emb)
+                if plain:
+                    parts.append(plain)
+            body = "\n".join(parts).strip()
+            if not body:
+                body = "（空 embed）"
+            body = await self._format_user_mentions_in_text(body, guild)
+            blocks.append(f"消息链接：{msg.jump_url}\n处罚内容：{body}")
+        if not blocks:
+            return "（近 10 条消息中无 embed）"
+        return "\n\n".join(blocks)
+
+    async def _expand_preset_variables(self, template: str) -> str:
+        out = template
+        if "%fetch_punishments%" in out:
+            repl = await self._expand_fetch_punishments()
+            out = out.replace("%fetch_punishments%", repl)
+        return out
 
     def _is_transient_bot_chunk(self, message: discord.Message) -> bool:
         """重建历史时忽略本 Bot 的中间状态占位消息"""
@@ -406,6 +597,131 @@ class AICustomerService(commands.Cog, name="AI客服"):
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
             f"[AI客服] 投诉频道状态恢复结束，共处理 {restored} 个文字频道",
         )
+
+    async def _complaint_channel_still_exists(self, channel_id: int) -> bool:
+        """投诉文字频道是否仍存在（get_channel 之外再 fetch，减轻缓存未命中误杀）"""
+        if self.bot.get_channel(channel_id) is not None:
+            return True
+        try:
+            await self.bot.fetch_channel(channel_id)
+            return True
+        except discord.NotFound:
+            return False
+        except Exception:
+            return True
+
+    async def _parse_complaint_channel_id_from_admin_thread(
+        self, thread: discord.Thread,
+    ) -> Optional[int]:
+        """从子区内本 Bot 早期消息解析投诉频道 ID（新投诉通知 / send_to_admin 头）"""
+        header_pat = re.compile(r"\*\*来自 <#(\d+)>")
+        notify_pat = re.compile(r"新投诉频道 <#(\d+)>")
+        async for msg in thread.history(limit=50, oldest_first=True):
+            if msg.author.id != self.bot.user.id:
+                continue
+            text = msg.content or ""
+            m = notify_pat.search(text)
+            if m:
+                return int(m.group(1))
+            m = header_pat.search(text)
+            if m:
+                return int(m.group(1))
+        return None
+
+    def _monitored_complaint_channel_names(self, guild: discord.Guild) -> set[str]:
+        """配置的分类下现存投诉文字频道的名称集合"""
+        names: set[str] = set()
+        for cat_id in self.auto_reply_category_ids:
+            cat = guild.get_channel(cat_id)
+            if isinstance(cat, discord.CategoryChannel):
+                for ch in cat.text_channels:
+                    names.add(ch.name)
+        return names
+
+    async def _maybe_archive_orphan_admin_thread(
+        self,
+        thread: discord.Thread,
+        guild: discord.Guild,
+    ) -> bool:
+        """
+        若子区无法对应仍存在的投诉频道则归档。
+        优先根据子区历史解析频道 ID；无法解析时在监控分类中按子区名匹配。
+        """
+        if thread.archived:
+            return False
+
+        cid = await self._parse_complaint_channel_id_from_admin_thread(thread)
+        should_archive = False
+        reason = ""
+
+        if cid is not None:
+            if not await self._complaint_channel_still_exists(cid):
+                should_archive = True
+                reason = f"映射投诉频道 {cid} 已不存在"
+        elif self.auto_reply_category_ids:
+            names = self._monitored_complaint_channel_names(guild)
+            if thread.name not in names:
+                should_archive = True
+                reason = (
+                    f"子区「{thread.name}」在监控分类中无同名文字频道"
+                )
+
+        if not should_archive:
+            return False
+        try:
+            await thread.edit(archived=True)
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"[AI客服] 已归档无主投诉频道子区 #{thread.name} ({thread.id})：{reason}",
+            )
+            stale_keys = [k for k, t in self.channel_threads.items() if t.id == thread.id]
+            for k in stale_keys:
+                self.channel_threads.pop(k, None)
+            return True
+        except discord.Forbidden:
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"[AI客服] 无权归档子区 {thread.id}",
+            )
+        except discord.HTTPException as e:
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"[AI客服] 归档子区 {thread.id} 失败: {e}",
+            )
+        return False
+
+    async def _archive_orphan_admin_threads_at_startup(self):
+        """启动时扫描管理频道下的活动子区，无对应投诉频道则 archived=True"""
+        if not self.admin_channel_id:
+            return
+        admin_parent = self.bot.get_channel(self.admin_channel_id)
+        if admin_parent is None:
+            try:
+                admin_parent = await self.bot.fetch_channel(self.admin_channel_id)
+            except Exception:
+                return
+        if not isinstance(admin_parent, (discord.TextChannel, discord.ForumChannel)):
+            return
+        guild = admin_parent.guild
+        print(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+            "[AI客服] 扫描管理频道子区，清理无主映射…",
+        )
+        n = 0
+        for t in list(admin_parent.threads):
+            try:
+                if await self._maybe_archive_orphan_admin_thread(t, guild):
+                    n += 1
+            except Exception as e:
+                print(
+                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"[AI客服] 检查子区 {getattr(t, 'id', '?')} 时出错: {e}",
+                )
+        if n:
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"[AI客服] 无主投诉子区归档完成，共 {n} 个",
+            )
 
     def _is_admin(self, member: discord.Member) -> bool:
         """判断成员是否属于管理组"""
@@ -1006,6 +1322,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
         async def _delayed_restore():
             await asyncio.sleep(2)
             await self._restore_auto_reply_state()
+            await self._archive_orphan_admin_threads_at_startup()
 
         asyncio.create_task(_delayed_restore())
 
