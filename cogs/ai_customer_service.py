@@ -2080,7 +2080,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
             # type == 'empty'
             try:
-                await bot_message.edit(content="⚠️ AI未生成回复")
+                await bot_message.delete()
             except discord.HTTPException:
                 pass
             break
