@@ -67,20 +67,6 @@ class ChannelManager(commands.Cog, name="频道管理"):
     async def change_channel_name(self, interaction: discord.Interaction, 新频道名: str, emoji: Optional[str] = None):
         """修改频道名称的斜杠命令"""
         
-        # 检查用户权限
-        if not self.check_role_permission(interaction.user):
-            allowed_roles = [
-                interaction.guild.get_role(role_id).name 
-                for role_id in self.allowed_role_ids 
-                if interaction.guild.get_role(role_id)
-            ]
-            roles_str = "、".join(allowed_roles) if allowed_roles else "无"
-            await interaction.response.send_message(
-                f"❌ 你没有权限使用此命令！\n需要以下身份组之一: {roles_str}",
-                ephemeral=True
-            )
-            return
-        
         # 检查频道权限
         if not self.check_channel_permission(interaction.channel.id):
             await interaction.response.send_message(
