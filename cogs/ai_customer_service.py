@@ -186,7 +186,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.llm_provider = str(
             cfg.get('ai_customer_service.provider', 'gemini')
         ).strip().lower()
-        if self.llm_provider not in ('gemini', 'claude_openai'):
+        if self.llm_provider not in ('gemini', 'claude_openai', 'claude_messages'):
             self.llm_provider = 'gemini'
 
         self.api_key = cfg.get('ai_customer_service.gemini.api_key', '')
@@ -232,6 +232,31 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.claude_openai_thinking: Optional[dict[str, Any]] = (
             dict(raw_thinking) if isinstance(raw_thinking, dict) else None
         )
+
+        # ─ Claude Messages（原生 /v1/messages）配置 ─
+        self.claude_messages_api_key = cfg.get(
+            'ai_customer_service.claude_messages.api_key', ''
+        )
+        _cm_bu = cfg.get(
+            'ai_customer_service.claude_messages.base_url',
+            'https://api.anthropic.com/v1/',
+        )
+        self.claude_messages_base_url = _cm_bu.rstrip('/') + '/'
+        self.claude_messages_model = cfg.get(
+            'ai_customer_service.claude_messages.model',
+            'claude-opus-4-7',
+        )
+        self.claude_messages_max_tokens = int(
+            cfg.get('ai_customer_service.claude_messages.max_tokens', 8192)
+        )
+        self.claude_messages_interleaved_thinking = bool(
+            cfg.get('ai_customer_service.claude_messages.interleaved_thinking', False)
+        )
+        raw_cm_thinking = cfg.get('ai_customer_service.claude_messages.thinking')
+        self.claude_messages_thinking: Optional[dict[str, Any]] = (
+            dict(raw_cm_thinking) if isinstance(raw_cm_thinking, dict) else None
+        )
+
         self.debug_stream_full_log = bool(
             cfg.get('ai_customer_service.debug_stream_full_log', False)
         )
@@ -265,6 +290,8 @@ class AICustomerService(commands.Cog, name="AI客服"):
     def _llm_configured(self) -> bool:
         if self.llm_provider == 'claude_openai':
             return bool(self.claude_openai_api_key)
+        if self.llm_provider == 'claude_messages':
+            return bool(self.claude_messages_api_key)
         return bool(self.api_key)
 
     async def _close_openai_client(self):
@@ -1184,6 +1211,61 @@ class AICustomerService(commands.Cog, name="AI客服"):
             })
         return out
 
+    def _build_claude_tools(self) -> list[dict[str, Any]]:
+        """Claude 官方 Messages API tools: [{name, description, input_schema}]"""
+        out: list[dict[str, Any]] = []
+        for decl in self._build_tools()[0].get('functionDeclarations', []):
+            params = decl.get('parameters') or {
+                'type': 'OBJECT',
+                'properties': {},
+            }
+            out.append({
+                'name': decl['name'],
+                'description': decl.get('description', ''),
+                'input_schema': self._gemini_value_to_json_schema(params),
+            })
+        return out
+
+    def _build_claude_system(self) -> str:
+        """Claude system 参数：使用与 Gemini 路径相同的 <time> 前缀 + system_prompt + tail_prompt"""
+        return self._system_prompt_text()
+
+    def _claude_thinking_param(self) -> Optional[dict[str, Any]]:
+        """
+        Claude Messages thinking 参数：
+        - enabled=false → None
+        - type=adaptive (默认) → {"type":"adaptive"} (+可选 display)
+        - type=enabled → {"type":"enabled","budget_tokens":N} (+可选 display)
+        """
+        t = self.claude_messages_thinking
+        if not t or not t.get('enabled'):
+            return None
+        ttype = str(t.get('type', 'adaptive')).strip().lower()
+        param: dict[str, Any]
+        if ttype == 'enabled':
+            budget = t.get('budget_tokens')
+            if budget is None:
+                effort = str(t.get('effort', 'medium')).lower()
+                budget = {
+                    'low': 2048,
+                    'medium': 8000,
+                    'high': 16000,
+                }.get(effort, 8000)
+            try:
+                budget_i = int(budget)
+            except (TypeError, ValueError):
+                budget_i = 8000
+            if budget_i < 1024:
+                budget_i = 1024
+            param = {'type': 'enabled', 'budget_tokens': budget_i}
+        else:
+            # adaptive: 不发送 budget_tokens，由模型自决
+            param = {'type': 'adaptive'}
+        display = t.get('display')
+        if isinstance(display, str) and display.lower() in ('summarized', 'omitted'):
+            param['display'] = display.lower()
+        return param
+
     def _gemini_user_parts_to_openai_content(
         self, parts: list,
     ) -> Union[str, list[dict[str, Any]]]:
@@ -1362,6 +1444,238 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 if tool_calls_oai:
                     asst['tool_calls'] = tool_calls_oai
                 messages.append(asst)
+
+        return messages
+
+    def _gemini_user_parts_to_claude_content(
+        self, parts: list,
+    ) -> Union[str, list[dict[str, Any]]]:
+        """把 Gemini user parts（text/inlineData）转换为 Claude user content。"""
+        chunks: list[dict[str, Any]] = []
+        for p in parts:
+            if not isinstance(p, dict):
+                continue
+            if 'text' in p:
+                chunks.append({'type': 'text', 'text': p['text']})
+            elif 'inlineData' in p:
+                mime = p['inlineData'].get('mimeType', 'application/octet-stream')
+                b64 = p['inlineData'].get('data', '')
+                if mime.startswith('image/'):
+                    chunks.append({
+                        'type': 'image',
+                        'source': {
+                            'type': 'base64',
+                            'media_type': mime,
+                            'data': b64,
+                        },
+                    })
+                else:
+                    chunks.append({
+                        'type': 'text',
+                        'text': f'[非内联图片附件: {mime}]',
+                    })
+        if not chunks:
+            return ''
+        if len(chunks) == 1 and chunks[0]['type'] == 'text':
+            return chunks[0]['text']
+        return chunks
+
+    def _gemini_contents_to_claude_messages(
+        self, contents: list,
+    ) -> list[dict[str, Any]]:
+        """
+        将内存中的 Gemini contents 转换为 Claude Messages API 的 messages 列表。
+        关键点：
+        - 若 model 回合带 `_claude_blocks`（claude_messages 路径写入），直接当作 assistant content
+          原样回传，保留 thinking 块与 signature；同时把其中 tool_use 的 id 序列作为
+          pending_tool_use_ids，供随后的 functionResponse 块按序配对。
+        - 没有 `_claude_blocks` 时走 best-effort 降级：合成 toolu_xxx id，无 thinking 块。
+        - 用户 functionResponse 块转 tool_result；fetch_messages 后续紧跟的 inlineData
+          图片合并到对应 tool_result.content 数组里。
+        """
+        messages: list[dict[str, Any]] = []
+        pending_tool_use_ids: list[str] = []
+        synth_seq = 0
+
+        for bi, block in enumerate(contents):
+            if not isinstance(block, dict):
+                continue
+            role = block.get('role')
+            parts = block.get('parts') or []
+
+            if role == 'user':
+                def _is_fr(p: Any) -> bool:
+                    return isinstance(p, dict) and 'functionResponse' in p
+
+                def _is_inline(p: Any) -> bool:
+                    return isinstance(p, dict) and 'inlineData' in p
+
+                if parts and any(_is_fr(p) for p in parts):
+                    # functionResponse + 可能夹带 inlineData 图片 + 可能混入普通 text/inlineData
+                    fr_idx = 0
+                    i = 0
+                    tool_result_blocks: list[dict[str, Any]] = []
+                    leading_user_chunks: list[dict[str, Any]] = []
+                    # 先把开头连续的非 fr part 单独放成一条 user 消息，再处理 fr
+                    while i < len(parts) and not _is_fr(parts[i]):
+                        p = parts[i]
+                        if isinstance(p, dict):
+                            if 'text' in p:
+                                leading_user_chunks.append({
+                                    'type': 'text', 'text': p['text'],
+                                })
+                            elif 'inlineData' in p:
+                                mime = p['inlineData'].get(
+                                    'mimeType', 'application/octet-stream'
+                                )
+                                b64 = p['inlineData'].get('data', '')
+                                if mime.startswith('image/'):
+                                    leading_user_chunks.append({
+                                        'type': 'image',
+                                        'source': {
+                                            'type': 'base64',
+                                            'media_type': mime,
+                                            'data': b64,
+                                        },
+                                    })
+                        i += 1
+                    if leading_user_chunks:
+                        messages.append({
+                            'role': 'user',
+                            'content': leading_user_chunks,
+                        })
+
+                    while i < len(parts):
+                        if not _is_fr(parts[i]):
+                            # 中段非 fr：尾随到下一个 user 消息里
+                            tail_chunks: list[dict[str, Any]] = []
+                            while i < len(parts) and not _is_fr(parts[i]):
+                                p = parts[i]
+                                if isinstance(p, dict):
+                                    if 'text' in p:
+                                        tail_chunks.append({
+                                            'type': 'text', 'text': p['text'],
+                                        })
+                                    elif 'inlineData' in p:
+                                        mime = p['inlineData'].get(
+                                            'mimeType', 'application/octet-stream'
+                                        )
+                                        b64 = p['inlineData'].get('data', '')
+                                        if mime.startswith('image/'):
+                                            tail_chunks.append({
+                                                'type': 'image',
+                                                'source': {
+                                                    'type': 'base64',
+                                                    'media_type': mime,
+                                                    'data': b64,
+                                                },
+                                            })
+                                i += 1
+                            if tail_chunks:
+                                # 这些非 fr 的内容应放在 tool_result 之后的新 user 消息中
+                                # 但 Claude 要求 tool_result 与紧邻的 user 输入在同一条
+                                # role:user 消息中。简化处理：附加到 tool_result_blocks 末尾。
+                                tool_result_blocks.extend(tail_chunks)
+                            continue
+                        fr = parts[i]['functionResponse']
+                        inner = fr.get('response', fr)
+                        text_payload = (
+                            inner
+                            if isinstance(inner, str)
+                            else json.dumps(inner, ensure_ascii=False)
+                        )
+                        if fr_idx < len(pending_tool_use_ids):
+                            tid = pending_tool_use_ids[fr_idx]
+                        else:
+                            synth_seq += 1
+                            tid = f'toolu_legacy_{bi}_{synth_seq}'
+                        fr_idx += 1
+                        i += 1
+                        inline_chunk: list[dict[str, Any]] = []
+                        while i < len(parts) and _is_inline(parts[i]):
+                            inline_chunk.append(parts[i])
+                            i += 1
+                        if inline_chunk:
+                            content_list: list[dict[str, Any]] = [
+                                {'type': 'text', 'text': text_payload},
+                            ]
+                            for ip in inline_chunk:
+                                mime = ip['inlineData'].get(
+                                    'mimeType', 'application/octet-stream'
+                                )
+                                b64 = ip['inlineData'].get('data', '')
+                                if mime.startswith('image/'):
+                                    content_list.append({
+                                        'type': 'image',
+                                        'source': {
+                                            'type': 'base64',
+                                            'media_type': mime,
+                                            'data': b64,
+                                        },
+                                    })
+                            tool_result_blocks.append({
+                                'type': 'tool_result',
+                                'tool_use_id': tid,
+                                'content': content_list,
+                            })
+                        else:
+                            tool_result_blocks.append({
+                                'type': 'tool_result',
+                                'tool_use_id': tid,
+                                'content': text_payload,
+                            })
+
+                    if tool_result_blocks:
+                        messages.append({
+                            'role': 'user',
+                            'content': tool_result_blocks,
+                        })
+                    pending_tool_use_ids = []
+                    continue
+
+                # 普通 user 消息（无 functionResponse）
+                content = self._gemini_user_parts_to_claude_content(parts)
+                messages.append({'role': 'user', 'content': content})
+                # 任何普通 user 消息进入后，先前残存的 pending 都应失效
+                pending_tool_use_ids = []
+
+            elif role == 'model':
+                # 优先使用 _claude_blocks（包含 thinking + signature + tool_use.id）
+                blocks = block.get('_claude_blocks')
+                if isinstance(blocks, list) and blocks:
+                    messages.append({'role': 'assistant', 'content': blocks})
+                    pending_tool_use_ids = [
+                        b.get('id', '')
+                        for b in blocks
+                        if isinstance(b, dict) and b.get('type') == 'tool_use'
+                    ]
+                    continue
+
+                # 降级：从 Gemini parts 重建（无 thinking、合成 tool_use id）
+                rebuilt: list[dict[str, Any]] = []
+                pending_tool_use_ids = []
+                for p in parts:
+                    if not isinstance(p, dict):
+                        continue
+                    if 'text' in p:
+                        txt = p.get('text') or ''
+                        if txt:
+                            rebuilt.append({'type': 'text', 'text': txt})
+                    elif 'functionCall' in p:
+                        fc = p['functionCall']
+                        synth_seq += 1
+                        tid = f'toolu_legacy_{bi}_{synth_seq}'
+                        rebuilt.append({
+                            'type': 'tool_use',
+                            'id': tid,
+                            'name': fc.get('name', ''),
+                            'input': fc.get('args', {}) or {},
+                        })
+                        pending_tool_use_ids.append(tid)
+                if not rebuilt:
+                    # Claude 要求 assistant content 非空
+                    rebuilt = [{'type': 'text', 'text': ''}]
+                messages.append({'role': 'assistant', 'content': rebuilt})
 
         return messages
 
@@ -1831,6 +2145,289 @@ class AICustomerService(commands.Cog, name="AI客服"):
             })
         return result_claude
 
+    async def _call_claude_messages_stream(
+        self,
+        channel_id: int,
+        bot_message: discord.Message,
+    ) -> dict:
+        """
+        直接调用 Claude 官方 Messages API（POST /v1/messages，SSE 流式）。
+        严格按官方协议处理 tool_use / tool_result 与 thinking 块（含 signature 多轮连续性）。
+        参考：
+          - https://platform.claude.com/docs/en/build-with-claude/streaming
+          - https://platform.claude.com/docs/en/build-with-claude/extended-thinking
+          - https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview
+        """
+        if not self.claude_messages_api_key:
+            raise RuntimeError('claude_messages 未配置 API Key')
+
+        history = self.conversations.get(channel_id, [])
+        messages = self._gemini_contents_to_claude_messages(history)
+        tools = self._build_claude_tools()
+
+        request_body: dict[str, Any] = {
+            'model': self.claude_messages_model,
+            'max_tokens': self.claude_messages_max_tokens,
+            'stream': True,
+            'system': self._build_claude_system(),
+            'messages': messages,
+            'tools': tools,
+        }
+        thinking_param = self._claude_thinking_param()
+        if thinking_param is not None:
+            request_body['thinking'] = thinking_param
+
+        headers = {
+            'x-api-key': self.claude_messages_api_key,
+            'anthropic-version': '2023-06-01',
+            'content-type': 'application/json',
+            'accept': 'text/event-stream',
+        }
+        if self.claude_messages_interleaved_thinking:
+            headers['anthropic-beta'] = 'interleaved-thinking-2025-05-14'
+
+        url = f'{self.claude_messages_base_url}messages'
+
+        last_edit_time = 0.0
+        min_edit_interval = 1.0 / 3
+        max_retries = 3
+
+        full_text = ''
+        blocks_by_idx: dict[int, dict[str, Any]] = {}
+        stop_reason: Optional[str] = None
+        usage_final: Any = None
+        sse_events_dump: list[dict[str, Any]] = []
+
+        for attempt in range(max_retries):
+            full_text = ''
+            blocks_by_idx = {}
+            stop_reason = None
+            usage_final = None
+            sse_events_dump = []
+
+            resp = await self.session.post(
+                url,
+                data=json.dumps(request_body, ensure_ascii=False).encode('utf-8'),
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=600),
+            )
+            if resp.status in (429, 529, 524):
+                err_body = await resp.text()
+                resp.release()
+                if attempt < max_retries - 1:
+                    retry_after = 8
+                    try:
+                        retry_after = int(resp.headers.get('Retry-After', '8') or 8)
+                    except (ValueError, TypeError):
+                        retry_after = 8
+                    try:
+                        await bot_message.edit(
+                            content=f'⏳ Claude API 限流/过载（{resp.status}），'
+                                    f'{retry_after}秒后重试...'
+                        )
+                    except discord.HTTPException:
+                        pass
+                    await asyncio.sleep(retry_after)
+                    continue
+                raise Exception(
+                    f'Claude Messages API 错误 ({resp.status}): {err_body[:500]}'
+                )
+            if resp.status != 200:
+                err_body = await resp.text()
+                resp.release()
+                raise Exception(
+                    f'Claude Messages API 错误 ({resp.status}): {err_body[:500]}'
+                )
+
+            async with resp:
+                current_event: Optional[str] = None
+                while True:
+                    line_bytes = await resp.content.readline()
+                    if not line_bytes:
+                        break
+                    line = line_bytes.decode('utf-8', errors='replace').rstrip('\r\n')
+                    if not line:
+                        current_event = None
+                        continue
+                    if line.startswith(':'):
+                        continue
+                    if line.startswith('event: '):
+                        current_event = line[7:].strip()
+                        continue
+                    if not line.startswith('data: '):
+                        continue
+                    data_str = line[6:]
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if self.debug_stream_full_log:
+                        sse_events_dump.append(data)
+                        if len(sse_events_dump) > 2000:
+                            sse_events_dump = sse_events_dump[-2000:]
+
+                    etype = data.get('type') or current_event or ''
+
+                    if etype == 'ping':
+                        continue
+                    if etype == 'error':
+                        err = data.get('error') or {}
+                        raise Exception(
+                            f"Claude API 流式错误: "
+                            f"{err.get('type', 'unknown')} - {err.get('message', '')}"
+                        )
+                    if etype == 'message_start':
+                        msg_obj = data.get('message') or {}
+                        u = msg_obj.get('usage')
+                        if u is not None:
+                            usage_final = u
+                        continue
+                    if etype == 'content_block_start':
+                        idx = data.get('index', 0)
+                        cb = data.get('content_block') or {}
+                        blocks_by_idx[idx] = dict(cb)
+                        # 初始化累加器
+                        cb_type = cb.get('type')
+                        if cb_type == 'text':
+                            blocks_by_idx[idx].setdefault('text', '')
+                        elif cb_type == 'thinking':
+                            blocks_by_idx[idx].setdefault('thinking', '')
+                            blocks_by_idx[idx].setdefault('signature', '')
+                        elif cb_type == 'tool_use':
+                            blocks_by_idx[idx].setdefault('input', {})
+                            blocks_by_idx[idx]['_partial_json'] = ''
+                        continue
+                    if etype == 'content_block_delta':
+                        idx = data.get('index', 0)
+                        delta = data.get('delta') or {}
+                        dtype = delta.get('type')
+                        block = blocks_by_idx.setdefault(idx, {})
+                        if dtype == 'text_delta':
+                            t = delta.get('text', '') or ''
+                            block['text'] = (block.get('text') or '') + t
+                            if block.get('type') == 'text':
+                                full_text += t
+                                now = time.monotonic()
+                                if now - last_edit_time >= min_edit_interval:
+                                    try:
+                                        disp = (
+                                            full_text[:1997] + '...'
+                                            if len(full_text) > 2000
+                                            else full_text
+                                        )
+                                        await bot_message.edit(
+                                            content=disp if disp else '…'
+                                        )
+                                        last_edit_time = now
+                                    except discord.HTTPException:
+                                        pass
+                        elif dtype == 'input_json_delta':
+                            pj = delta.get('partial_json', '') or ''
+                            block['_partial_json'] = (
+                                block.get('_partial_json') or ''
+                            ) + pj
+                        elif dtype == 'thinking_delta':
+                            th = delta.get('thinking', '') or ''
+                            block['thinking'] = (block.get('thinking') or '') + th
+                        elif dtype == 'signature_delta':
+                            sig = delta.get('signature', '') or ''
+                            block['signature'] = (block.get('signature') or '') + sig
+                        # citations_delta 等其他类型按需扩展，当前忽略
+                        continue
+                    if etype == 'content_block_stop':
+                        idx = data.get('index', 0)
+                        block = blocks_by_idx.get(idx)
+                        if block and block.get('type') == 'tool_use':
+                            raw = block.pop('_partial_json', '') or ''
+                            if raw:
+                                try:
+                                    parsed = json.loads(raw)
+                                except json.JSONDecodeError:
+                                    parsed = {}
+                            else:
+                                parsed = {}
+                            block['input'] = parsed if isinstance(parsed, dict) else {}
+                        continue
+                    if etype == 'message_delta':
+                        delta = data.get('delta') or {}
+                        if 'stop_reason' in delta:
+                            stop_reason = delta.get('stop_reason')
+                        u = data.get('usage')
+                        if u is not None:
+                            usage_final = u
+                        continue
+                    if etype == 'message_stop':
+                        break
+                    # 未知事件：忽略以保持向前兼容
+
+            break  # 成功，跳出重试循环
+
+        # 最终编辑一次确保完整
+        if full_text:
+            try:
+                disp = (
+                    full_text[:1997] + '...'
+                    if len(full_text) > 2000
+                    else full_text
+                )
+                await bot_message.edit(content=disp)
+            except discord.HTTPException:
+                pass
+
+        # 按 index 升序整理 _claude_blocks，并清理临时字段
+        ordered_blocks: list[dict[str, Any]] = []
+        for idx in sorted(blocks_by_idx.keys()):
+            b = dict(blocks_by_idx[idx])
+            b.pop('_partial_json', None)
+            ordered_blocks.append(b)
+
+        # 兼容 gemini-loop：把 tool_use 块映射为 functionCall
+        tool_call_parts: list[dict[str, Any]] = []
+        for b in ordered_blocks:
+            if b.get('type') == 'tool_use':
+                tool_call_parts.append({
+                    'functionCall': {
+                        'name': b.get('name', ''),
+                        'args': b.get('input', {}) or {},
+                    },
+                    '_claude_tool_use_id': b.get('id', ''),
+                })
+
+        if tool_call_parts:
+            result: dict[str, Any] = {
+                'type': 'tool_calls',
+                'tool_call_parts': tool_call_parts,
+                'text': full_text,
+                'text_signature': None,
+                '_claude_blocks': ordered_blocks,
+            }
+        elif full_text:
+            result = {
+                'type': 'text',
+                'text': full_text,
+                'text_signature': None,
+                '_claude_blocks': ordered_blocks,
+            }
+        else:
+            result = {'type': 'empty', '_claude_blocks': ordered_blocks}
+
+        if self.debug_stream_full_log:
+            self._debug_log_after_stream('claude_messages', channel_id, {
+                'model': self.claude_messages_model,
+                'base_url': self.claude_messages_base_url,
+                'thinking': thinking_param,
+                'interleaved_thinking': self.claude_messages_interleaved_thinking,
+                'stop_reason': stop_reason,
+                'usage_final': usage_final,
+                'sse_events': sse_events_dump,
+                'ordered_blocks': ordered_blocks,
+                'response': result,
+                'assistant_visible_text': full_text,
+            })
+
+        return result
+
     async def _call_llm_stream(
         self,
         channel_id: int,
@@ -1838,6 +2435,8 @@ class AICustomerService(commands.Cog, name="AI客服"):
     ) -> dict:
         if self.llm_provider == 'claude_openai':
             return await self._call_claude_openai_stream(channel_id, bot_message)
+        if self.llm_provider == 'claude_messages':
+            return await self._call_claude_messages_stream(channel_id, bot_message)
         return await self._call_gemini_stream(channel_id, bot_message)
 
     # ── 工具执行 ──────────────────────────────────────────────
@@ -1970,25 +2569,31 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 text_part: dict = {"text": text}
                 if result.get('text_signature'):
                     text_part['thoughtSignature'] = result['text_signature']
-                self.conversations[channel_id].append({
+                model_turn: dict[str, Any] = {
                     "role": "model",
                     "parts": [text_part],
-                })
+                }
+                if result.get('_claude_blocks'):
+                    model_turn['_claude_blocks'] = result['_claude_blocks']
+                self.conversations[channel_id].append(model_turn)
                 if len(text) > 2000:
                     for i in range(2000, len(text), 2000):
                         await channel.send(text[i:i + 2000])
                 break
 
             if result['type'] == 'tool_calls':
-                # 将模型的工具调用响应加入历史（保留 thoughtSignature）
+                # 将模型的工具调用响应加入历史（保留 thoughtSignature / _claude_blocks）
                 model_parts: list[dict] = []
                 if result.get('text'):
                     model_parts.append({"text": result['text']})
                 model_parts.extend(result['tool_call_parts'])
-                self.conversations[channel_id].append({
+                model_turn = {
                     "role": "model",
                     "parts": model_parts,
-                })
+                }
+                if result.get('_claude_blocks'):
+                    model_turn['_claude_blocks'] = result['_claude_blocks']
+                self.conversations[channel_id].append(model_turn)
 
                 # 逐个执行工具并收集结果
                 func_resp_parts = []

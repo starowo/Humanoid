@@ -47,8 +47,12 @@ message_cleaner:
 
 # AI客服配置
 ai_customer_service:
-  # 模型后端：gemini | claude_openai（后者使用官方 openai 包对接 Anthropic 兼容端点）
-  # 说明：https://platform.claude.com/docs/en/api/openai-sdk
+  # 模型后端：gemini | claude_openai | claude_messages
+  # - gemini: 原生 Gemini streamGenerateContent
+  # - claude_openai: 经 Anthropic 的 OpenAI 兼容层调用 Claude（chat.completions + tools）
+  #   说明：https://platform.claude.com/docs/en/api/openai-sdk
+  # - claude_messages: 直接调用官方 Claude Messages API（/v1/messages，SSE 流式）
+  #   严格支持 tool_use/tool_result、extended thinking 块及 signature 多轮连续性
   provider: gemini
 
   # 流式结束后在控制台全量打印模型回复（含思考、工具合并结果、用量、SSE 片段等，日志可能很大）
@@ -67,6 +71,28 @@ ai_customer_service:
       enabled: false
       effort: medium
       # budget_tokens: 16000
+
+  claude_messages:
+    # Anthropic Console 中的 API Key；仅当 provider=claude_messages 时必填
+    api_key: ""
+    # 官方 Messages API base URL，末尾需带 /
+    base_url: "https://api.anthropic.com/v1/"
+    model: "claude-opus-4-7"
+    max_tokens: 8192
+    # 通过 anthropic-beta 头启用 interleaved-thinking（Opus 4.6/4.7 已内置可保持 false）
+    interleaved_thinking: false
+    # Extended thinking 配置
+    # type: adaptive | enabled
+    #   - adaptive: 由模型自决预算（Opus 4.6/4.7 推荐；不发送 budget_tokens）
+    #   - enabled: 显式 budget_tokens（兼容旧 Claude 4 模型）
+    # display: summarized | omitted（流式下能否看到思考过程取决于该字段）
+    thinking:
+      enabled: false
+      type: adaptive
+      # 仅 type=enabled 时生效：effort 映射为 budget_tokens；也可直接写 budget_tokens 覆盖
+      effort: medium
+      # budget_tokens: 16000
+      display: summarized
 
   gemini:
     # Gemini API Key
