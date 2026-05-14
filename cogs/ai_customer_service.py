@@ -613,7 +613,6 @@ class AICustomerService(commands.Cog, name="AI客服"):
             mime = (content_type or '').split(';')[0].strip().lower()
             if not mime.startswith('image/'):
                 mime = hint_mime if hint_mime.startswith('image/') else 'image/png'
-            data, mime = await self._maybe_resize_image_for_claude(data, mime)
             b64 = base64.b64encode(data).decode('ascii')
             out.append({
                 'inlineData': {
@@ -1460,10 +1459,16 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 chunks.append({'type': 'text', 'text': p['text']})
             elif 'inlineData' in p:
                 mime = p['inlineData'].get('mimeType', 'application/octet-stream')
+                b64 = p['inlineData'].get('data', '')
                 if mime.startswith('image/'):
-                    block = self._gemini_inline_to_claude_image_block(p['inlineData'])
-                    if block is not None:
-                        chunks.append(block)
+                    chunks.append({
+                        'type': 'image',
+                        'source': {
+                            'type': 'base64',
+                            'media_type': mime,
+                            'data': b64,
+                        },
+                    })
                 else:
                     chunks.append({
                         'type': 'text',
@@ -1520,11 +1525,19 @@ class AICustomerService(commands.Cog, name="AI客服"):
                                     'type': 'text', 'text': p['text'],
                                 })
                             elif 'inlineData' in p:
-                                block = self._gemini_inline_to_claude_image_block(
-                                    p['inlineData'],
+                                mime = p['inlineData'].get(
+                                    'mimeType', 'application/octet-stream'
                                 )
-                                if block is not None:
-                                    leading_user_chunks.append(block)
+                                b64 = p['inlineData'].get('data', '')
+                                if mime.startswith('image/'):
+                                    leading_user_chunks.append({
+                                        'type': 'image',
+                                        'source': {
+                                            'type': 'base64',
+                                            'media_type': mime,
+                                            'data': b64,
+                                        },
+                                    })
                         i += 1
                     if leading_user_chunks:
                         messages.append({
@@ -1544,11 +1557,19 @@ class AICustomerService(commands.Cog, name="AI客服"):
                                             'type': 'text', 'text': p['text'],
                                         })
                                     elif 'inlineData' in p:
-                                        block = self._gemini_inline_to_claude_image_block(
-                                            p['inlineData'],
+                                        mime = p['inlineData'].get(
+                                            'mimeType', 'application/octet-stream'
                                         )
-                                        if block is not None:
-                                            tail_chunks.append(block)
+                                        b64 = p['inlineData'].get('data', '')
+                                        if mime.startswith('image/'):
+                                            tail_chunks.append({
+                                                'type': 'image',
+                                                'source': {
+                                                    'type': 'base64',
+                                                    'media_type': mime,
+                                                    'data': b64,
+                                                },
+                                            })
                                 i += 1
                             if tail_chunks:
                                 # 这些非 fr 的内容应放在 tool_result 之后的新 user 消息中
@@ -1579,11 +1600,19 @@ class AICustomerService(commands.Cog, name="AI客服"):
                                 {'type': 'text', 'text': text_payload},
                             ]
                             for ip in inline_chunk:
-                                block = self._gemini_inline_to_claude_image_block(
-                                    ip['inlineData'],
+                                mime = ip['inlineData'].get(
+                                    'mimeType', 'application/octet-stream'
                                 )
-                                if block is not None:
-                                    content_list.append(block)
+                                b64 = ip['inlineData'].get('data', '')
+                                if mime.startswith('image/'):
+                                    content_list.append({
+                                        'type': 'image',
+                                        'source': {
+                                            'type': 'base64',
+                                            'media_type': mime,
+                                            'data': b64,
+                                        },
+                                    })
                             tool_result_blocks.append({
                                 'type': 'tool_result',
                                 'tool_use_id': tid,
@@ -1650,100 +1679,6 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
         return messages
 
-    # Claude Messages API caps images at 8000x8000 px (2000x2000 if >20 imgs in
-    # one request). We clamp at 7680 to stay safely below the hard limit.
-    _CLAUDE_IMAGE_MAX_DIM = 7680
-
-    @staticmethod
-    def _resize_image_for_claude_sync(
-        data: bytes, content_type: str, max_dim: int = 7680,
-    ) -> tuple[bytes, str]:
-        if not content_type.startswith('image/') or not data:
-            return data, content_type
-        try:
-            from PIL import Image
-            import io
-
-            img = Image.open(io.BytesIO(data))
-            try:
-                w, h = img.size
-            except Exception:
-                return data, content_type
-            if w <= max_dim and h <= max_dim:
-                return data, content_type
-
-            scale = max_dim / float(max(w, h))
-            new_w = max(1, int(w * scale))
-            new_h = max(1, int(h * scale))
-            img.load()
-            resized = img.resize((new_w, new_h), Image.LANCZOS)
-
-            mime_lower = content_type.lower()
-            if 'webp' in mime_lower:
-                out_fmt, out_mime = 'WEBP', 'image/webp'
-            elif 'png' in mime_lower:
-                out_fmt, out_mime = 'PNG', 'image/png'
-            elif 'gif' in mime_lower:
-                out_fmt, out_mime = 'PNG', 'image/png'
-                if resized.mode == 'P':
-                    resized = resized.convert('RGBA')
-            else:
-                out_fmt, out_mime = 'JPEG', 'image/jpeg'
-                if resized.mode in ('RGBA', 'LA', 'P'):
-                    resized = resized.convert('RGB')
-
-            buf = io.BytesIO()
-            save_kwargs: dict[str, Any] = {}
-            if out_fmt == 'JPEG':
-                save_kwargs['quality'] = 92
-                save_kwargs['optimize'] = True
-            elif out_fmt == 'WEBP':
-                save_kwargs['quality'] = 92
-            resized.save(buf, format=out_fmt, **save_kwargs)
-            return buf.getvalue(), out_mime
-        except Exception:
-            return data, content_type
-
-    async def _maybe_resize_image_for_claude(
-        self, data: bytes, content_type: str,
-    ) -> tuple[bytes, str]:
-        try:
-            return await asyncio.to_thread(
-                self._resize_image_for_claude_sync,
-                data, content_type, self._CLAUDE_IMAGE_MAX_DIM,
-            )
-        except Exception:
-            return data, content_type
-
-    def _gemini_inline_to_claude_image_block(
-        self, inline_data: dict,
-    ) -> Optional[dict[str, Any]]:
-        """Build a Claude image block from a Gemini inlineData dict, downscaling
-        the base64 payload if it exceeds Claude's pixel cap. Returns None for
-        non-image inlineData."""
-        mime = inline_data.get('mimeType', 'application/octet-stream')
-        b64 = inline_data.get('data', '')
-        if not mime.startswith('image/') or not b64:
-            return None
-        try:
-            raw = base64.b64decode(b64)
-            new_raw, new_mime = self._resize_image_for_claude_sync(
-                raw, mime, self._CLAUDE_IMAGE_MAX_DIM,
-            )
-            if new_raw is not raw:
-                b64 = base64.b64encode(new_raw).decode('ascii')
-                mime = new_mime
-        except Exception:
-            pass
-        return {
-            'type': 'image',
-            'source': {
-                'type': 'base64',
-                'media_type': mime,
-                'data': b64,
-            },
-        }
-
     async def _download_attachment(self, url: str) -> tuple[bytes, str]:
         try:
             async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -1792,10 +1727,6 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 )
 
                 if inline_supported:
-                    if content_type.startswith('image/'):
-                        data, content_type = await self._maybe_resize_image_for_claude(
-                            data, content_type,
-                        )
                     b64_data = base64.b64encode(data).decode('utf-8')
                     parts.append({
                         "inlineData": {
