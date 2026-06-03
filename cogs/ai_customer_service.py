@@ -142,6 +142,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.bot = bot
         self.config_loader = bot.config_loader
         self.conversations: dict[int, list] = {}
+        self.recorded_context_message_ids: dict[int, set[int]] = {}
         self.active_channels: set[int] = set()
         self.processing_channels: set[int] = set()
         self.pending_messages: dict[int, list[discord.Message]] = {}
@@ -2009,6 +2010,11 @@ class AICustomerService(commands.Cog, name="AI客服"):
         else:
             parts.append({"text": user_tag})
 
+        for i, embed in enumerate(message.embeds):
+            plain = self._embed_to_plain_text(embed)
+            if plain:
+                parts.append({"text": f"[embed {i + 1}]\n{plain}"})
+
         for attachment in message.attachments:
             if attachment.size > self.max_attachment_size:
                 parts.append({
@@ -3209,6 +3215,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
                         pass
                     self.active_channels.discard(channel_id)
                     self.conversations.pop(channel_id, None)
+                    self.recorded_context_message_ids.pop(channel_id, None)
                     self.channel_complainants.pop(channel_id, None)
                     self.channel_threads.pop(channel_id, None)
                     return
@@ -3292,10 +3299,34 @@ class AICustomerService(commands.Cog, name="AI客服"):
         """仅将消息记入对话历史，不触发 AI 回复"""
         if channel_id not in self.conversations:
             self.conversations[channel_id] = []
+        seen_ids = self.recorded_context_message_ids.setdefault(channel_id, set())
+        if message.id in seen_ids:
+            return
+        seen_ids.add(message.id)
         user_msg = await self._build_user_message(message)
         self.conversations[channel_id].append(user_msg)
         if len(self.conversations[channel_id]) > self.max_history:
             self.conversations[channel_id] = self.conversations[channel_id][-self.max_history:]
+
+    async def _seed_existing_bot_messages(
+        self,
+        channel: discord.TextChannel,
+        *,
+        limit: int = 25,
+    ) -> int:
+        """自动开启前，读取频道里已经存在的其他 bot 消息作为上下文，不触发回复。"""
+        bot_uid = self.bot.user.id if self.bot.user else None
+        seeded = 0
+        async for msg in channel.history(limit=limit, oldest_first=True):
+            if msg.type not in (discord.MessageType.default, discord.MessageType.reply):
+                continue
+            if not msg.author.bot:
+                continue
+            if bot_uid is not None and msg.author.id == bot_uid:
+                continue
+            await self._record_only(channel.id, msg)
+            seeded += 1
+        return seeded
 
     def _is_complainant(self, channel_id: int, user_id: int) -> bool:
         """判断是否为该频道的原始投诉人"""
@@ -3306,6 +3337,8 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
     def _should_respond(self, channel_id: int, message: discord.Message) -> bool:
         """判断是否应对该消息触发 AI 回复（仅原始投诉人）"""
+        if message.author.bot:
+            return False
         is_admin = isinstance(message.author, discord.Member) and self._is_admin(message.author)
         if is_admin:
             return False
@@ -3394,11 +3427,25 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
         self.active_channels.add(channel.id)
         self.conversations[channel.id] = []
+        self.recorded_context_message_ids[channel.id] = set()
 
         # 在管理频道创建 thread
         await self._create_admin_thread(channel)
 
         await asyncio.sleep(1)
+
+        try:
+            seeded = await self._seed_existing_bot_messages(channel)
+            if seeded:
+                print(
+                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"[AI客服] 已读取 #{channel.name} 中已有 bot 开场消息 {seeded} 条"
+                )
+        except Exception as e:
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"[AI客服] 读取已有 bot 开场消息失败 #{channel.name}: {e}"
+            )
 
         try:
             await channel.send(self.greeting_message)
@@ -3458,6 +3505,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.active_channels.discard(channel.id)
         self.channel_complainants.pop(channel.id, None)
         self.conversations.pop(channel.id, None)
+        self.recorded_context_message_ids.pop(channel.id, None)
 
         if thread is not None:
             try:
@@ -3479,12 +3527,12 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """监听活跃频道中的用户消息并自动回复"""
-        if message.author.bot:
-            return
+        """监听活跃频道中的消息；其他 bot 消息只记入上下文，不触发回复"""
         if message.type not in (discord.MessageType.default, discord.MessageType.reply):
             return
         if message.channel.id not in self.active_channels:
+            return
+        if message.author.bot and self.bot.user and message.author.id == self.bot.user.id:
             return
         if not self._llm_configured():
             return
@@ -3534,6 +3582,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
                         )
                     except Exception as e:
                         self.conversations.pop(channel_id, None)
+                        self.recorded_context_message_ids.pop(channel_id, None)
                         self.channel_complainants.pop(channel_id, None)
                         self.channel_threads.pop(channel_id, None)
                         if channel_id not in self.conversations:
@@ -3559,6 +3608,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
         else:
             self.active_channels.discard(channel_id)
             self.conversations.pop(channel_id, None)
+            self.recorded_context_message_ids.pop(channel_id, None)
             self.channel_complainants.pop(channel_id, None)
             self.channel_threads.pop(channel_id, None)
             await interaction.response.send_message("✅ AI客服已在此频道关闭", ephemeral=True)
