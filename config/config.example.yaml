@@ -47,12 +47,13 @@ message_cleaner:
 
 # AI客服配置
 ai_customer_service:
-  # 模型后端：gemini | claude_openai | claude_messages
+  # 模型后端：gemini | claude_openai | claude_messages | openai_responses
   # - gemini: 原生 Gemini streamGenerateContent
   # - claude_openai: 经 Anthropic 的 OpenAI 兼容层调用 Claude（chat.completions + tools）
   #   说明：https://platform.claude.com/docs/en/api/openai-sdk
   # - claude_messages: 直接调用官方 Claude Messages API（/v1/messages，SSE 流式）
   #   严格支持 tool_use/tool_result、extended thinking 块及 signature 多轮连续性
+  # - openai_responses: 调用 OpenAI Responses API（/v1/responses，支持流式文本与 function tools）
   provider: gemini
 
   # 流式结束后在控制台全量打印模型回复（含思考、工具合并结果、用量、SSE 片段等，日志可能很大）
@@ -71,6 +72,17 @@ ai_customer_service:
       enabled: false
       effort: medium
       # budget_tokens: 16000
+
+  openai_responses:
+    # OpenAI API Key；仅当 provider=openai_responses 时必填
+    api_key: ""
+    # OpenAI API Base URL，末尾需带 /
+    base_url: "https://api.openai.com/v1/"
+    model: "gpt-4.1"
+    max_output_tokens: 8192
+    # 可选：Responses API reasoning 参数，留空则不发送
+    # reasoning:
+    #   effort: medium
 
   claude_messages:
     # Anthropic Console 中的 API Key；仅当 provider=claude_messages 时必填

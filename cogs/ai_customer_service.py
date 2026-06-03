@@ -186,7 +186,12 @@ class AICustomerService(commands.Cog, name="AI客服"):
         self.llm_provider = str(
             cfg.get('ai_customer_service.provider', 'gemini')
         ).strip().lower()
-        if self.llm_provider not in ('gemini', 'claude_openai', 'claude_messages'):
+        if self.llm_provider not in (
+            'gemini',
+            'claude_openai',
+            'claude_messages',
+            'openai_responses',
+        ):
             self.llm_provider = 'gemini'
 
         self.api_key = cfg.get('ai_customer_service.gemini.api_key', '')
@@ -231,6 +236,27 @@ class AICustomerService(commands.Cog, name="AI客服"):
         raw_thinking = cfg.get('ai_customer_service.claude_openai.thinking')
         self.claude_openai_thinking: Optional[dict[str, Any]] = (
             dict(raw_thinking) if isinstance(raw_thinking, dict) else None
+        )
+
+        # ─ OpenAI Responses API 配置 ─
+        self.openai_responses_api_key = cfg.get(
+            'ai_customer_service.openai_responses.api_key', ''
+        )
+        _or_bu = cfg.get(
+            'ai_customer_service.openai_responses.base_url',
+            'https://api.openai.com/v1/',
+        )
+        self.openai_responses_base_url = _or_bu.rstrip('/') + '/'
+        self.openai_responses_model = cfg.get(
+            'ai_customer_service.openai_responses.model',
+            'gpt-4.1',
+        )
+        self.openai_responses_max_output_tokens = int(
+            cfg.get('ai_customer_service.openai_responses.max_output_tokens', 8192)
+        )
+        raw_or_reasoning = cfg.get('ai_customer_service.openai_responses.reasoning')
+        self.openai_responses_reasoning: Optional[dict[str, Any]] = (
+            dict(raw_or_reasoning) if isinstance(raw_or_reasoning, dict) else None
         )
 
         # ─ Claude Messages（原生 /v1/messages）配置 ─
@@ -290,6 +316,8 @@ class AICustomerService(commands.Cog, name="AI客服"):
     def _llm_configured(self) -> bool:
         if self.llm_provider == 'claude_openai':
             return bool(self.claude_openai_api_key)
+        if self.llm_provider == 'openai_responses':
+            return bool(self.openai_responses_api_key)
         if self.llm_provider == 'claude_messages':
             return bool(self.claude_messages_api_key)
         return bool(self.api_key)
@@ -305,19 +333,28 @@ class AICustomerService(commands.Cog, name="AI客服"):
     async def _ensure_openai_client(self):
         """按当前 provider 创建或关闭 AsyncOpenAI 客户端"""
         await self._close_openai_client()
-        if self.llm_provider != 'claude_openai' or not self.claude_openai_api_key:
+        api_key = ''
+        base_url = ''
+        provider_label = self.llm_provider
+        if self.llm_provider == 'claude_openai':
+            api_key = self.claude_openai_api_key
+            base_url = self.claude_openai_base_url
+        elif self.llm_provider == 'openai_responses':
+            api_key = self.openai_responses_api_key
+            base_url = self.openai_responses_base_url
+        if not api_key:
             return
         try:
             from openai import AsyncOpenAI
         except ImportError as e:
             print(
                 f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-                f"[AI客服] 未安装 openai 包，无法使用 claude_openai: {e}"
+                f"[AI客服] 未安装 openai 包，无法使用 {provider_label}: {e}"
             )
             return
         self._openai_client = AsyncOpenAI(
-            api_key=self.claude_openai_api_key,
-            base_url=self.claude_openai_base_url,
+            api_key=api_key,
+            base_url=base_url,
         )
 
     def _claude_openai_extra_body(self) -> Optional[dict[str, Any]]:
@@ -1212,6 +1249,25 @@ class AICustomerService(commands.Cog, name="AI客服"):
             })
         return out
 
+    def _build_responses_tools(self) -> list[dict[str, Any]]:
+        """Responses API function tools 使用扁平 schema，不是 chat.completions 的嵌套 function。"""
+        out: list[dict[str, Any]] = []
+        for decl in self._build_tools()[0].get('functionDeclarations', []):
+            params = decl.get('parameters') or {
+                'type': 'OBJECT',
+                'properties': {},
+            }
+            out.append({
+                'type': 'function',
+                'name': decl['name'],
+                'description': decl.get('description', ''),
+                'parameters': self._gemini_value_to_json_schema(params),
+                # 现有工具 schema 没有为所有 object 显式追加 additionalProperties=false；
+                # 关闭 strict 可以保持与 Gemini/Claude 分支一致的宽松入参行为。
+                'strict': False,
+            })
+        return out
+
     def _build_claude_tools(self) -> list[dict[str, Any]]:
         """Claude 官方 Messages API tools: [{name, description, input_schema}]"""
         out: list[dict[str, Any]] = []
@@ -1447,6 +1503,190 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 messages.append(asst)
 
         return messages
+
+    @staticmethod
+    def _obj_field(obj: Any, key: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    @staticmethod
+    def _plain_obj(obj: Any) -> Any:
+        if hasattr(obj, 'model_dump'):
+            try:
+                return obj.model_dump(exclude_none=True)
+            except Exception:
+                pass
+        return obj
+
+    def _gemini_user_parts_to_responses_content(
+        self, parts: list,
+    ) -> Union[str, list[dict[str, Any]]]:
+        chunks: list[dict[str, Any]] = []
+        for p in parts:
+            if not isinstance(p, dict):
+                continue
+            if 'text' in p:
+                chunks.append({'type': 'input_text', 'text': p['text']})
+            elif 'inlineData' in p:
+                mime = p['inlineData'].get('mimeType', 'application/octet-stream')
+                b64 = p['inlineData'].get('data', '')
+                if mime.startswith('image/'):
+                    chunks.append({
+                        'type': 'input_image',
+                        'image_url': f'data:{mime};base64,{b64}',
+                        'detail': 'auto',
+                    })
+                else:
+                    chunks.append({
+                        'type': 'input_text',
+                        'text': f'[非内联图片附件: {mime}]',
+                    })
+        if not chunks:
+            return ''
+        if len(chunks) == 1 and chunks[0]['type'] == 'input_text':
+            return chunks[0]['text']
+        return chunks
+
+    def _function_response_to_responses_output(
+        self,
+        fr: dict[str, Any],
+        inline_parts: list[dict[str, Any]],
+    ) -> Union[str, list[dict[str, Any]]]:
+        inner = fr.get('response', fr)
+        text_payload = (
+            inner
+            if isinstance(inner, str)
+            else json.dumps(inner, ensure_ascii=False)
+        )
+        if not inline_parts:
+            return text_payload
+
+        out: list[dict[str, Any]] = [{'type': 'input_text', 'text': text_payload}]
+        inline_content = self._gemini_user_parts_to_responses_content(inline_parts)
+        if isinstance(inline_content, list):
+            out.extend(inline_content)
+        elif inline_content:
+            out.append({'type': 'input_text', 'text': inline_content})
+        return out
+
+    def _gemini_contents_to_responses_input(
+        self,
+        contents: list,
+    ) -> list[dict[str, Any]]:
+        """
+        将内存中的 Gemini contents 转为 Responses API input items。
+        Responses 的工具调用/结果是顶层 input item，因此这里保留 call_id 以支持多轮工具循环。
+        """
+        items: list[dict[str, Any]] = []
+        pending_call_ids: list[str] = []
+        call_seq = 0
+
+        for bi, block in enumerate(contents):
+            if not isinstance(block, dict):
+                continue
+            role = block.get('role')
+            parts = block.get('parts') or []
+
+            if role == 'user':
+                def _is_fr(p: Any) -> bool:
+                    return isinstance(p, dict) and 'functionResponse' in p
+
+                def _is_inline(p: Any) -> bool:
+                    return isinstance(p, dict) and 'inlineData' in p
+
+                if parts and any(_is_fr(p) for p in parts):
+                    fr_idx = 0
+                    i = 0
+                    while i < len(parts):
+                        if not _is_fr(parts[i]):
+                            j = i
+                            while j < len(parts) and not _is_fr(parts[j]):
+                                j += 1
+                            content = self._gemini_user_parts_to_responses_content(
+                                parts[i:j]
+                            )
+                            if content:
+                                items.append({'role': 'user', 'content': content})
+                            i = j
+                            continue
+
+                        fr = parts[i]['functionResponse']
+                        i += 1
+                        inline_chunk: list[dict[str, Any]] = []
+                        while i < len(parts) and _is_inline(parts[i]):
+                            inline_chunk.append(parts[i])
+                            i += 1
+
+                        if fr_idx >= len(pending_call_ids):
+                            # 没有可配对的 call_id 时退化为普通用户上下文，避免构造无效的工具结果。
+                            fn = fr.get('name', 'unknown_tool')
+                            output = self._function_response_to_responses_output(
+                                fr, inline_chunk
+                            )
+                            if isinstance(output, str):
+                                fallback = f'[工具结果: {fn}]\n{output}'
+                            else:
+                                fallback = [{'type': 'input_text', 'text': f'[工具结果: {fn}]'}]
+                                fallback.extend(output)
+                            items.append({'role': 'user', 'content': fallback})
+                            fr_idx += 1
+                            continue
+
+                        items.append({
+                            'type': 'function_call_output',
+                            'call_id': pending_call_ids[fr_idx],
+                            'output': self._function_response_to_responses_output(
+                                fr, inline_chunk
+                            ),
+                        })
+                        fr_idx += 1
+                    pending_call_ids = []
+                    continue
+
+                content = self._gemini_user_parts_to_responses_content(parts)
+                if content:
+                    items.append({'role': 'user', 'content': content})
+                pending_call_ids = []
+
+            elif role == 'model':
+                text_buf: list[str] = []
+                function_items: list[dict[str, Any]] = []
+                pending_call_ids = []
+                for p in parts:
+                    if not isinstance(p, dict):
+                        continue
+                    if 'text' in p:
+                        text_buf.append(p['text'])
+                    elif 'functionCall' in p:
+                        fc = p['functionCall']
+                        call_seq += 1
+                        call_id = (
+                            p.get('_responses_call_id')
+                            or p.get('_openai_call_id')
+                            or f'call_legacy_{bi}_{call_seq}'
+                        )
+                        pending_call_ids.append(call_id)
+                        args = fc.get('args', {})
+                        function_item: dict[str, Any] = {
+                            'type': 'function_call',
+                            'call_id': call_id,
+                            'name': fc.get('name', ''),
+                            'arguments': json.dumps(args, ensure_ascii=False)
+                            if args
+                            else '{}',
+                        }
+                        item_id = p.get('_responses_item_id')
+                        if item_id:
+                            function_item['id'] = item_id
+                        function_items.append(function_item)
+
+                merged_text = ''.join(text_buf)
+                if merged_text:
+                    items.append({'role': 'assistant', 'content': merged_text})
+                items.extend(function_items)
+
+        return items
 
     def _gemini_user_parts_to_claude_content(
         self, parts: list,
@@ -2214,6 +2454,251 @@ class AICustomerService(commands.Cog, name="AI客服"):
             })
         return result_claude
 
+    async def _call_openai_responses_stream(
+        self,
+        channel_id: int,
+        bot_message: discord.Message,
+    ) -> dict:
+        """
+        调用 OpenAI Responses API（POST /v1/responses），流式更新 bot_message。
+        对话仍存为 Gemini 形态，请求前转换为 Responses input items。
+        """
+        if self._openai_client is None:
+            raise RuntimeError(
+                'OpenAI Responses 客户端未就绪：请设置 provider 为 openai_responses '
+                '并配置 ai_customer_service.openai_responses.api_key，且已 pip 安装 openai'
+            )
+
+        history = self.conversations.get(channel_id, [])
+        input_items = self._gemini_contents_to_responses_input(history)
+        tools = self._build_responses_tools()
+
+        last_edit_time = 0.0
+        min_edit_interval = 1.0 / 3
+        max_retries = 3
+
+        full_text = ''
+        tool_acc: dict[int, dict[str, Any]] = {}
+        response_final: Any = None
+        stream_debug_events: list[Any] = []
+        response_error: Any = None
+
+        def ensure_tool_acc(index: int) -> dict[str, Any]:
+            if index not in tool_acc:
+                tool_acc[index] = {
+                    'id': '',
+                    'call_id': '',
+                    'name': '',
+                    'arguments': '',
+                }
+            return tool_acc[index]
+
+        def merge_function_item(index: int, item: Any) -> None:
+            if not item:
+                return
+            if self._obj_field(item, 'type') != 'function_call':
+                return
+            acc = ensure_tool_acc(index)
+            item_id = self._obj_field(item, 'id', '')
+            call_id = self._obj_field(item, 'call_id', '')
+            name = self._obj_field(item, 'name', '')
+            arguments = self._obj_field(item, 'arguments', None)
+            if item_id:
+                acc['id'] = item_id
+            if call_id:
+                acc['call_id'] = call_id
+            if name:
+                acc['name'] = name
+            if arguments is not None:
+                acc['arguments'] = arguments or ''
+
+        for attempt in range(max_retries):
+            full_text = ''
+            tool_acc = {}
+            response_final = None
+            stream_debug_events = []
+            response_error = None
+            try:
+                kwargs: dict[str, Any] = {
+                    'model': self.openai_responses_model,
+                    'input': input_items,
+                    'instructions': self._system_prompt_text(),
+                    'tools': tools,
+                    'max_output_tokens': self.openai_responses_max_output_tokens,
+                    'stream': True,
+                    'parallel_tool_calls': True,
+                }
+                if self.openai_responses_reasoning:
+                    kwargs['reasoning'] = self.openai_responses_reasoning
+
+                stream = await self._openai_client.responses.create(**kwargs)
+                async for event in stream:
+                    etype = getattr(event, 'type', '')
+                    if self.debug_stream_full_log:
+                        stream_debug_events.append(self._plain_obj(event))
+                        if len(stream_debug_events) > 2000:
+                            stream_debug_events = stream_debug_events[-2000:]
+
+                    if etype == 'response.output_text.delta':
+                        delta = getattr(event, 'delta', '') or ''
+                        full_text += delta
+                        now = time.monotonic()
+                        if now - last_edit_time >= min_edit_interval:
+                            try:
+                                display = (
+                                    full_text[:1997] + '...'
+                                    if len(full_text) > 2000
+                                    else full_text
+                                )
+                                await bot_message.edit(
+                                    content=display if display else '…'
+                                )
+                                last_edit_time = now
+                            except discord.HTTPException:
+                                pass
+                        continue
+
+                    if etype == 'response.output_text.done':
+                        done_text = getattr(event, 'text', None)
+                        if done_text and len(done_text) > len(full_text):
+                            full_text = done_text
+                        continue
+
+                    if etype == 'response.output_item.added':
+                        idx = getattr(event, 'output_index', len(tool_acc))
+                        merge_function_item(int(idx), getattr(event, 'item', None))
+                        continue
+
+                    if etype == 'response.function_call_arguments.delta':
+                        idx = int(getattr(event, 'output_index', len(tool_acc)))
+                        acc = ensure_tool_acc(idx)
+                        item_id = getattr(event, 'item_id', '')
+                        if item_id:
+                            acc['id'] = item_id
+                        acc['arguments'] += getattr(event, 'delta', '') or ''
+                        continue
+
+                    if etype == 'response.function_call_arguments.done':
+                        idx = int(getattr(event, 'output_index', len(tool_acc)))
+                        acc = ensure_tool_acc(idx)
+                        item = getattr(event, 'item', None)
+                        if item is not None:
+                            merge_function_item(idx, item)
+                        item_id = getattr(event, 'item_id', '')
+                        call_id = getattr(event, 'call_id', '')
+                        name = getattr(event, 'name', '')
+                        arguments = getattr(event, 'arguments', None)
+                        if item_id:
+                            acc['id'] = item_id
+                        if call_id:
+                            acc['call_id'] = call_id
+                        if name:
+                            acc['name'] = name
+                        if arguments is not None:
+                            acc['arguments'] = arguments or ''
+                        continue
+
+                    if etype == 'response.output_item.done':
+                        idx = getattr(event, 'output_index', len(tool_acc))
+                        merge_function_item(int(idx), getattr(event, 'item', None))
+                        continue
+
+                    if etype == 'response.completed':
+                        response_final = getattr(event, 'response', None)
+                        continue
+
+                    if etype in ('response.failed', 'error'):
+                        response_error = (
+                            getattr(event, 'error', None)
+                            or self._obj_field(getattr(event, 'response', None), 'error')
+                        )
+                        raise Exception(f'OpenAI Responses API 流式错误: {response_error}')
+
+                break
+            except Exception as e:
+                msg = str(e).lower()
+                if attempt < max_retries - 1 and (
+                    '429' in msg
+                    or 'rate' in msg
+                    or 'overloaded' in msg
+                    or 'temporarily' in msg
+                ):
+                    try:
+                        await bot_message.edit(
+                            content='⏳ OpenAI Responses API 限流/过载，数秒后重试...'
+                        )
+                    except discord.HTTPException:
+                        pass
+                    await asyncio.sleep(8)
+                    continue
+                raise
+
+        if full_text:
+            try:
+                disp = (
+                    full_text[:1997] + '...'
+                    if len(full_text) > 2000
+                    else full_text
+                )
+                await bot_message.edit(content=disp)
+            except discord.HTTPException:
+                pass
+
+        tool_call_parts: list[dict[str, Any]] = []
+        for idx in sorted(tool_acc.keys()):
+            acc = tool_acc[idx]
+            name = acc.get('name') or ''
+            if not name:
+                continue
+            raw_args = acc.get('arguments') or '{}'
+            try:
+                args_parsed = json.loads(raw_args) if raw_args else {}
+            except json.JSONDecodeError:
+                args_parsed = {}
+            tool_part = {
+                'functionCall': {
+                    'name': name,
+                    'args': args_parsed if isinstance(args_parsed, dict) else {},
+                },
+            }
+            if acc.get('call_id'):
+                tool_part['_responses_call_id'] = acc['call_id']
+            if acc.get('id'):
+                tool_part['_responses_item_id'] = acc['id']
+            tool_call_parts.append(tool_part)
+
+        if tool_call_parts:
+            result_openai: dict[str, Any] = {
+                'type': 'tool_calls',
+                'tool_call_parts': tool_call_parts,
+                'text': full_text,
+                'text_signature': None,
+            }
+        elif full_text:
+            result_openai = {
+                'type': 'text',
+                'text': full_text,
+                'text_signature': None,
+            }
+        else:
+            result_openai = {'type': 'empty'}
+
+        if self.debug_stream_full_log:
+            self._debug_log_after_stream('openai_responses', channel_id, {
+                'model': self.openai_responses_model,
+                'base_url': self.openai_responses_base_url,
+                'reasoning': self.openai_responses_reasoning,
+                'input_items': input_items,
+                'tools': tools,
+                'tool_calls_merged_raw': dict(tool_acc),
+                'response_final': self._plain_obj(response_final),
+                'response_error': self._plain_obj(response_error),
+                'response': result_openai,
+                'assistant_visible_text': full_text,
+                'stream_events': stream_debug_events,
+            })
+        return result_openai
+
     async def _call_claude_messages_stream(
         self,
         channel_id: int,
@@ -2504,6 +2989,8 @@ class AICustomerService(commands.Cog, name="AI客服"):
     ) -> dict:
         if self.llm_provider == 'claude_openai':
             return await self._call_claude_openai_stream(channel_id, bot_message)
+        if self.llm_provider == 'openai_responses':
+            return await self._call_openai_responses_stream(channel_id, bot_message)
         if self.llm_provider == 'claude_messages':
             return await self._call_claude_messages_stream(channel_id, bot_message)
         return await self._call_gemini_stream(channel_id, bot_message)
@@ -3021,7 +3508,8 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 await interaction.response.send_message(
                     "❌ 未配置 LLM API Key："
                     "gemini 请设 ai_customer_service.gemini.api_key，"
-                    "claude_openai 请设 ai_customer_service.claude_openai.api_key",
+                    "claude_openai 请设 ai_customer_service.claude_openai.api_key，"
+                    "openai_responses 请设 ai_customer_service.openai_responses.api_key",
                     ephemeral=True,
                 )
                 return
