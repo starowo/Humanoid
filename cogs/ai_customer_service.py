@@ -1571,6 +1571,15 @@ class AICustomerService(commands.Cog, name="AI客服"):
             out.append({'type': 'input_text', 'text': inline_content})
         return out
 
+    def _openai_responses_model_needs_reasoning_items(self) -> bool:
+        model = str(self.openai_responses_model or '').lower()
+        return (
+            bool(self.openai_responses_reasoning)
+            or model.startswith('gpt-5')
+            or model.startswith(('o1', 'o3', 'o4'))
+            or 'reasoning' in model
+        )
+
     def _gemini_contents_to_responses_input(
         self,
         contents: list,
@@ -1654,6 +1663,11 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 text_buf: list[str] = []
                 function_items: list[dict[str, Any]] = []
                 pending_call_ids = []
+                reasoning_items = [
+                    dict(ri)
+                    for ri in (block.get('_responses_reasoning_items') or [])
+                    if isinstance(ri, dict)
+                ]
                 for p in parts:
                     if not isinstance(p, dict):
                         continue
@@ -1683,9 +1697,33 @@ class AICustomerService(commands.Cog, name="AI客服"):
                         function_items.append(function_item)
 
                 merged_text = ''.join(text_buf)
-                if merged_text:
-                    items.append({'role': 'assistant', 'content': merged_text})
-                items.extend(function_items)
+                if function_items:
+                    if merged_text:
+                        items.append({'role': 'assistant', 'content': merged_text})
+                    if reasoning_items:
+                        items.extend(reasoning_items)
+                    if not reasoning_items and self._openai_responses_model_needs_reasoning_items():
+                        # 旧历史里可能已有 function_call，但当时还没保存 reasoning item。
+                        # reasoning 模型会拒绝这种残缺回放；降级成普通 assistant 文本，
+                        # 后续 functionResponse 也会按普通 user 上下文写入。
+                        pending_call_ids = []
+                        fallback_lines = []
+                        for fi in function_items:
+                            fallback_lines.append(
+                                f"[工具调用: {fi.get('name', '')}]\n{fi.get('arguments', '{}')}"
+                            )
+                        if fallback_lines:
+                            items.append({
+                                'role': 'assistant',
+                                'content': '\n'.join(fallback_lines),
+                            })
+                    else:
+                        items.extend(function_items)
+                else:
+                    if reasoning_items:
+                        items.extend(reasoning_items)
+                    if merged_text:
+                        items.append({'role': 'assistant', 'content': merged_text})
 
         return items
 
@@ -2485,6 +2523,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
         full_text = ''
         tool_acc: dict[int, dict[str, Any]] = {}
+        reasoning_items_by_idx: dict[int, dict[str, Any]] = {}
         response_final: Any = None
         stream_debug_events: list[Any] = []
         response_error: Any = None
@@ -2518,9 +2557,23 @@ class AICustomerService(commands.Cog, name="AI客服"):
             if arguments is not None:
                 acc['arguments'] = arguments or ''
 
+        def merge_reasoning_item(index: int, item: Any) -> None:
+            if not item:
+                return
+            if self._obj_field(item, 'type') != 'reasoning':
+                return
+            plain = self._plain_obj(item)
+            if isinstance(plain, dict):
+                reasoning_items_by_idx[index] = plain
+
+        def merge_output_item(index: int, item: Any) -> None:
+            merge_reasoning_item(index, item)
+            merge_function_item(index, item)
+
         for attempt in range(max_retries):
             full_text = ''
             tool_acc = {}
+            reasoning_items_by_idx = {}
             response_final = None
             stream_debug_events = []
             response_error = None
@@ -2533,6 +2586,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
                     'max_output_tokens': self.openai_responses_max_output_tokens,
                     'stream': True,
                     'parallel_tool_calls': True,
+                    'include': ['reasoning.encrypted_content'],
                 }
                 if self.openai_responses_reasoning:
                     kwargs['reasoning'] = self.openai_responses_reasoning
@@ -2572,7 +2626,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
                     if etype == 'response.output_item.added':
                         idx = getattr(event, 'output_index', len(tool_acc))
-                        merge_function_item(int(idx), getattr(event, 'item', None))
+                        merge_output_item(int(idx), getattr(event, 'item', None))
                         continue
 
                     if etype == 'response.function_call_arguments.delta':
@@ -2606,11 +2660,14 @@ class AICustomerService(commands.Cog, name="AI客服"):
 
                     if etype == 'response.output_item.done':
                         idx = getattr(event, 'output_index', len(tool_acc))
-                        merge_function_item(int(idx), getattr(event, 'item', None))
+                        merge_output_item(int(idx), getattr(event, 'item', None))
                         continue
 
                     if etype == 'response.completed':
                         response_final = getattr(event, 'response', None)
+                        output_items = self._obj_field(response_final, 'output', []) or []
+                        for ridx, item in enumerate(output_items):
+                            merge_output_item(ridx, item)
                         continue
 
                     if etype in ('response.failed', 'error'):
@@ -2651,6 +2708,10 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 pass
 
         tool_call_parts: list[dict[str, Any]] = []
+        reasoning_items = [
+            reasoning_items_by_idx[idx]
+            for idx in sorted(reasoning_items_by_idx.keys())
+        ]
         for idx in sorted(tool_acc.keys()):
             acc = tool_acc[idx]
             name = acc.get('name') or ''
@@ -2680,14 +2741,20 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 'text': full_text,
                 'text_signature': None,
             }
+            if reasoning_items:
+                result_openai['_responses_reasoning_items'] = reasoning_items
         elif full_text:
             result_openai = {
                 'type': 'text',
                 'text': full_text,
                 'text_signature': None,
             }
+            if reasoning_items:
+                result_openai['_responses_reasoning_items'] = reasoning_items
         else:
             result_openai = {'type': 'empty'}
+            if reasoning_items:
+                result_openai['_responses_reasoning_items'] = reasoning_items
 
         if self.debug_stream_full_log:
             self._debug_log_after_stream('openai_responses', channel_id, {
@@ -2697,6 +2764,7 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 'input_items': input_items,
                 'tools': tools,
                 'tool_calls_merged_raw': dict(tool_acc),
+                'reasoning_items': reasoning_items,
                 'response_final': self._plain_obj(response_final),
                 'response_error': self._plain_obj(response_error),
                 'response': result_openai,
@@ -3137,6 +3205,10 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 }
                 if result.get('_claude_blocks'):
                     model_turn['_claude_blocks'] = result['_claude_blocks']
+                if result.get('_responses_reasoning_items'):
+                    model_turn['_responses_reasoning_items'] = result[
+                        '_responses_reasoning_items'
+                    ]
                 self.conversations[channel_id].append(model_turn)
                 if len(text) > 2000:
                     for i in range(2000, len(text), 2000):
@@ -3155,6 +3227,10 @@ class AICustomerService(commands.Cog, name="AI客服"):
                 }
                 if result.get('_claude_blocks'):
                     model_turn['_claude_blocks'] = result['_claude_blocks']
+                if result.get('_responses_reasoning_items'):
+                    model_turn['_responses_reasoning_items'] = result[
+                        '_responses_reasoning_items'
+                    ]
                 self.conversations[channel_id].append(model_turn)
 
                 # 逐个执行工具并收集结果
@@ -3323,6 +3399,9 @@ class AICustomerService(commands.Cog, name="AI客服"):
             if not msg.author.bot:
                 continue
             if bot_uid is not None and msg.author.id == bot_uid:
+                continue
+            seen_ids = self.recorded_context_message_ids.setdefault(channel.id, set())
+            if msg.id in seen_ids:
                 continue
             await self._record_only(channel.id, msg)
             seeded += 1
