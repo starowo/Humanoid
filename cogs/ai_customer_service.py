@@ -2042,7 +2042,13 @@ class AICustomerService(commands.Cog, name="AI客服"):
         author = message.author
         is_admin = isinstance(author, discord.Member) and self._is_admin(author)
         role_attr = ' role="admin"' if is_admin else ''
-        user_tag = f"<odyxml:user name=\"{author.display_name}\" id=\"{author.id}\"{role_attr}>"
+        ts = message.created_at.astimezone(
+            timezone(timedelta(hours=8))
+        ).strftime('%Y-%m-%d %H:%M:%S')
+        user_tag = (
+            f"<odyxml:user name=\"{author.display_name}\" id=\"{author.id}\" "
+            f"time=\"{ts}\"{role_attr}>"
+        )
         if message.content:
             parts.append({"text": f"{user_tag}\n{message.content}"})
         else:
