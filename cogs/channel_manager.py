@@ -21,10 +21,24 @@ class ChannelManager(commands.Cog, name="频道管理"):
     def load_config(self):
         """加载配置"""
         self.allowed_role_ids = self.config_loader.get('allowed_role_ids', [])
-        self.allowed_channel_ids = self.config_loader.get('channel_manager.allowed_channel_ids', [])
         self.cooldown_seconds = self.config_loader.get('channel_manager.cooldown', 300)
         self.default_emoji = self.config_loader.get('channel_manager.default_emoji', '💬')
         self.banned_words_by_channel = self.config_loader.get('channel_manager.banned_words', {})
+
+        # 频道 -> 该频道允许使用改名命令的身份组列表 的映射
+        # 新格式：channel_manager.channel_roles: { 频道ID: [身份组ID, ...] }
+        #   value 为空列表表示该频道所有人可用
+        # 旧格式兼容：channel_manager.allowed_channel_ids: [频道ID, ...]
+        #   每个频道回退使用全局 allowed_role_ids
+        self.channel_role_map = {}
+        channel_roles = self.config_loader.get('channel_manager.channel_roles', {})
+        if channel_roles:
+            for channel_id, role_ids in channel_roles.items():
+                self.channel_role_map[int(channel_id)] = list(role_ids or [])
+        else:
+            allowed_channel_ids = self.config_loader.get('channel_manager.allowed_channel_ids', [])
+            for channel_id in allowed_channel_ids:
+                self.channel_role_map[int(channel_id)] = list(self.allowed_role_ids or [])
     
     async def on_config_reload(self):
         """配置重载回调"""
@@ -53,10 +67,20 @@ class ChannelManager(commands.Cog, name="频道管理"):
     
     def check_channel_permission(self, channel_id: int) -> bool:
         """检查频道是否允许被修改"""
-        if not self.allowed_channel_ids:
+        if not self.channel_role_map:
             return False  # 如果没有配置频道，不允许修改任何频道
-        
-        return channel_id in self.allowed_channel_ids
+
+        return channel_id in self.channel_role_map
+
+    def check_channel_role_permission(self, member: discord.Member, channel_id: int) -> bool:
+        """检查用户是否有权限在指定频道使用改名命令"""
+        allowed_roles = self.channel_role_map.get(channel_id)
+        if not allowed_roles:
+            # 该频道未配置身份组限制（空列表或未配置）：所有人可用
+            return True
+
+        member_role_ids = [role.id for role in member.roles]
+        return any(role_id in member_role_ids for role_id in allowed_roles)
     
     @app_commands.command(name="改改的名", description="修改当前频道的名称")
     @app_commands.describe(
@@ -74,7 +98,15 @@ class ChannelManager(commands.Cog, name="频道管理"):
                 ephemeral=True
             )
             return
-        
+
+        # 检查该频道对应的身份组权限
+        if not self.check_channel_role_permission(interaction.user, interaction.channel.id):
+            await interaction.response.send_message(
+                "❌ 你没有权限修改此频道的名称！\n请联系管理员确认你的身份组。",
+                ephemeral=True
+            )
+            return
+
         # 验证频道名称
         new_name = 新频道名.strip()
         if not new_name:
